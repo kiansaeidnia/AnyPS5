@@ -79,6 +79,53 @@ class CheckCompileTests(unittest.TestCase):
                     for path, content in outputs.items():
                         self.assertEqual(path.read_bytes(), content)
 
+    def test_saved_temporaries_do_not_rewrite_files_or_hide_compiler_errors(self):
+        compiler = shutil.which("gcc") or shutil.which("clang")
+        if compiler is None:
+            self.skipTest("needs a C compiler")
+        source = self.source("unit.c")
+        for option, field in (("-save-temps", "arguments"), ("--save-temps", "command"),
+                              ("-save-temps=cwd", "arguments"), ("-save-temps=obj", "command")):
+            with self.subTest(option=option, field=field):
+                source.write_text("#ifndef REQUIRED\n#error missing definition\n#endif\nint value;\n", encoding="utf-8")
+                arguments = [compiler, "-Werror", "-DREQUIRED", option, "-c", str(source),
+                             "-o", str(self.build / "unit.o")]
+                original = subprocess.run(arguments, cwd=self.build, capture_output=True, text=True)
+                self.assertEqual(original.returncode, 0, original.stderr)
+                for name in ("a-unit", "a-unit.i"):
+                    (self.build / name).write_bytes(b"previous build output")
+                command = (subprocess.list2cmdline(arguments) if os.name == "nt" else
+                           " ".join(shlex.quote(argument) for argument in arguments))
+                self.manifest([{"directory": str(self.build), "file": str(source),
+                                field: arguments if field == "arguments" else command}])
+                preserved = {path: path.read_bytes() for path in self.build.iterdir()}
+                result = self.tool("unit.c")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 translation units compile", result.stdout)
+                for path, content in preserved.items():
+                    self.assertEqual(path.read_bytes(), content, str(path))
+                self.assertEqual(set(self.build.iterdir()), set(preserved))
+                source.write_text("#error syntax_check_must_fail\n", encoding="utf-8")
+                result = self.tool("unit.c")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("syntax_check_must_fail", result.stderr)
+                for path, content in preserved.items():
+                    self.assertEqual(path.read_bytes(), content, str(path))
+                self.assertEqual(set(self.build.iterdir()), set(preserved))
+
+    def test_unknown_saved_temporary_mode_is_still_rejected_by_the_compiler(self):
+        compiler = shutil.which("gcc") or shutil.which("clang")
+        if compiler is None:
+            self.skipTest("needs a C compiler")
+        source = self.source("unit.c")
+        self.manifest([{"directory": str(self.build), "file": str(source),
+                        "arguments": [compiler, "-save-temps=invalid", "-c", str(source),
+                                      "-o", str(self.build / "unit.o")]}])
+        result = self.tool("unit.c")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("save-temps", result.stderr)
+        self.assertFalse((self.build / "unit.o").exists())
+
     def test_ninja_response_file_is_expanded_before_syntax_rewriting(self):
         compiler = shutil.which("clang") or shutil.which("gcc")
         if compiler is None or shutil.which("ninja") is None:
