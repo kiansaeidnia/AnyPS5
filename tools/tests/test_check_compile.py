@@ -15,7 +15,49 @@ import check_compile
 TOOL = Path(__file__).resolve().parents[1] / "check_compile.py"
 
 
-class CheckCompileTests(unittest.TestCase):
+class CheckCompileFixture(unittest.TestCase):
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.root = Path(holder.name).resolve()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "tests@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "tests"], check=True)
+        self.build = self.root / "build"
+        self.build.mkdir()
+
+    def tool(self, *arguments, env=None):
+        environment = dict(os.environ)
+        environment.update(env or {})
+        return subprocess.run([sys.executable, "-I", str(TOOL), *arguments], cwd=self.root,
+                              capture_output=True, text=True, encoding="utf-8", env=environment)
+
+    def source(self, relative, text="int x;\n"):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def compiler(self, body, name="compiler.py"):
+        script = self.root / name
+        script.write_text(body, encoding="utf-8")
+        return script
+
+    def entry(self, relative, command):
+        return {"directory": str(self.build), "command": command, "file": str(self.root / relative)}
+
+    def manifest(self, entries):
+        (self.build / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+
+    def failing(self, relative, message=None):
+        source = self.source(relative)
+        message = message if message is not None else f"{relative}:1:1: error: no\n"
+        script = self.compiler("import sys\nsys.stderr.write(%r)\nsys.exit(1)\n" % message)
+        self.manifest([self.entry(relative, f'"{sys.executable}" "{script}" "{source}"')])
+        return source
+
+
+class CheckCompileOutputTests(CheckCompileFixture):
     def test_unexpanded_response_files_cannot_rewrite_build_outputs(self):
         compiler = shutil.which("clang")
         if compiler is None:
@@ -201,46 +243,7 @@ class CheckCompileTests(unittest.TestCase):
                 self.assertEqual(fragment.read_bytes(), b"previous compilation fragment")
 
 
-    def setUp(self):
-        holder = tempfile.TemporaryDirectory()
-        self.addCleanup(holder.cleanup)
-        self.root = Path(holder.name).resolve()
-        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
-        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "tests@example.com"], check=True)
-        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "tests"], check=True)
-        self.build = self.root / "build"
-        self.build.mkdir()
-
-    def tool(self, *arguments, env=None):
-        environment = dict(os.environ)
-        environment.update(env or {})
-        return subprocess.run([sys.executable, "-I", str(TOOL), *arguments], cwd=self.root,
-                              capture_output=True, text=True, encoding="utf-8", env=environment)
-
-    def source(self, relative, text="int x;\n"):
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        return path
-
-    def compiler(self, body, name="compiler.py"):
-        script = self.root / name
-        script.write_text(body, encoding="utf-8")
-        return script
-
-    def entry(self, relative, command):
-        return {"directory": str(self.build), "command": command, "file": str(self.root / relative)}
-
-    def manifest(self, entries):
-        (self.build / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
-
-    def failing(self, relative, message=None):
-        source = self.source(relative)
-        message = message if message is not None else f"{relative}:1:1: error: no\n"
-        script = self.compiler("import sys\nsys.stderr.write(%r)\nsys.exit(1)\n" % message)
-        self.manifest([self.entry(relative, f'"{sys.executable}" "{script}" "{source}"')])
-        return source
-
+class CheckCompileTests(CheckCompileFixture):
     def test_a_translation_unit_that_does_not_compile_fails_with_the_compiler_output(self):
         self.failing("unit.cpp")
         result = self.tool("unit.cpp")
