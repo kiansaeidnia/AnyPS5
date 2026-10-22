@@ -113,11 +113,16 @@ class CheckCompileTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), content, str(path))
                 self.assertEqual(set(self.build.iterdir()), set(preserved))
 
-    def test_unknown_saved_temporary_mode_is_still_rejected_by_the_compiler(self):
+    def test_rejected_saved_temporary_mode_is_not_hidden(self):
         compiler = shutil.which("gcc") or shutil.which("clang")
         if compiler is None:
             self.skipTest("needs a C compiler")
         source = self.source("unit.c")
+        original = subprocess.run([compiler, "-save-temps=invalid", "-fsyntax-only", str(source)],
+                                  cwd=self.build, capture_output=True, text=True)
+        if original.returncode == 0:
+            self.skipTest("compiler accepts unknown saved-temporary modes with -fsyntax-only")
+        self.assertIn("save-temps", original.stderr)
         self.manifest([{"directory": str(self.build), "file": str(source),
                         "arguments": [compiler, "-save-temps=invalid", "-c", str(source),
                                       "-o", str(self.build / "unit.o")]}])
