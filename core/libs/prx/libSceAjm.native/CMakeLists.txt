@@ -52,6 +52,11 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME atrac9_config_data COMMAND atrac9_config_data_tests)
 
+    add_test_executable(atrac9_utility_tests tests/Atrac9Utility.c)
+    target_include_directories(atrac9_utility_tests PRIVATE ${LIBATRAC9_DIR})
+    target_link_libraries(atrac9_utility_tests PRIVATE atrac9)
+    add_test(NAME atrac9_utility COMMAND atrac9_utility_tests)
+
     add_test_executable(guest_ajm_tests ${LIBS_INCLUDE_DIR}/tests/GuestAjm.cpp)
     target_include_directories(guest_ajm_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_ajm_tests PRIVATE libSceAjm.native libc)
