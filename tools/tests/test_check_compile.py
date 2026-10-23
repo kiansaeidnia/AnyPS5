@@ -134,7 +134,7 @@ class CheckCompileOutputTests(CheckCompileFixture):
                              "-o", str(self.build / "unit.o")]
                 original = subprocess.run(arguments, cwd=self.build, capture_output=True, text=True)
                 self.assertEqual(original.returncode, 0, original.stderr)
-                for name in ("a-unit", "a-unit.i"):
+                for name in ("a-unit", "a-unit.i", "unit.i"):
                     (self.build / name).write_bytes(b"previous build output")
                 command = (subprocess.list2cmdline(arguments) if os.name == "nt" else
                            " ".join(shlex.quote(argument) for argument in arguments))
