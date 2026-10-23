@@ -23,7 +23,7 @@ def main():
             "    _exit(function && function() == 42 ? 42 : 1);\n"
             "}\n")
         library = work / "probe.so"
-        subprocess.run([os.environ.get("CC", "cc"), "-shared", "-fPIC", str(probe), "-o", str(library), "-ldl", "-Wl,-init,check"], check=True)
+        subprocess.run([os.environ.get("CC", "cc"), "-D_GNU_SOURCE", "-shared", "-fPIC", str(probe), "-o", str(library), "-ldl", "-Wl,-init,check"], check=True)
         image = fixture()
         strings = b"\0FixtureExport#A#B\0".ljust(32, b"\0") + str(library).encode() + b"\0"
         image[0x4600:0x4600 + len(strings)] = strings
