@@ -33,6 +33,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/AjmLibrary.cmake)
 add_sce_ajm_library(libSceAjm.native)
 
 if(BUILD_TESTING)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME atrac9_patched_sources COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patched_sources.py
+            ${CMAKE_COMMAND} ${LIBATRAC9_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/PatchLibAtrac9.cmake)
+    endif()
+
     add_test_executable(atrac9_gradient_tests tests/Atrac9Gradient.c ${LIBATRAC9_DIR}/bit_reader.c)
     target_include_directories(atrac9_gradient_tests PRIVATE ${LIBATRAC9_PATCHED_DIR} ${LIBATRAC9_DIR})
     target_link_libraries(atrac9_gradient_tests PRIVATE atrac9)
