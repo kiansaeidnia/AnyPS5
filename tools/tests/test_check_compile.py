@@ -126,9 +126,14 @@ class CheckCompileOutputTests(CheckCompileFixture):
         if compiler is None:
             self.skipTest("needs a C compiler")
         source = self.source("unit.c")
-        for option, field in (("-save-temps", "arguments"), ("--save-temps", "command"),
-                              ("-save-temps=cwd", "arguments"), ("-save-temps=obj", "command")):
-            with self.subTest(option=option, field=field):
+        cases = [(compiler, option, field) for option, field in
+                 (("-save-temps", "arguments"), ("--save-temps", "command"),
+                  ("-save-temps=cwd", "arguments"), ("-save-temps=obj", "command"))]
+        clang = shutil.which("clang")
+        if clang is not None:
+            cases.extend(((clang, "--save-temps=cwd", "command"), (clang, "--save-temps=obj", "arguments")))
+        for compiler, option, field in cases:
+            with self.subTest(compiler=compiler, option=option, field=field):
                 source.write_text("#ifndef REQUIRED\n#error missing definition\n#endif\nint value;\n", encoding="utf-8")
                 arguments = [compiler, "-Werror", "-DREQUIRED", option, "-c", str(source),
                              "-o", str(self.build / "unit.o")]
