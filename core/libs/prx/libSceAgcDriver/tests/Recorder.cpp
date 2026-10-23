@@ -1651,15 +1651,13 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     before = KeyProofCounts();
     Require(before.scanned == after.scanned + 1 && proof.keys == DccKeys::Clear0001, "(9) the CPU write did not make a scan");
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the new keys were not proved");
-    // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
-    // are not kept until its batch signaled.
     recorder.NotePendingWrite(address, keyCount);
     MarkWritten(address, keyCount);
     before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a second scan under a pending write was kept");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) an unknown pending write was not synchronized before proving keys");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the synchronized proof did not hold");
     after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
+    Require(after.scanned == before.scanned + 1 && after.unstable == before.unstable && after.proved == before.proved + 1, "(9) a synchronized key scan was miscounted");
     recorder.Submit();
     device.WaitQueue();
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a signaled write kept the scan unstable");
@@ -3764,10 +3762,11 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     }
     constexpr std::uint32_t width = 4;
     constexpr std::uint32_t height = 4;
-    alignas(256) static std::array<float, width * height> texels{};
+    alignas(256) static std::array<float, width * height * 16u> texels{};
     texels.fill(1.0f);
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
     const std::array<std::uint32_t, 8> texture{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((width - 1u) & 3u) << 30u), ((width - 1u) >> 2u) | ((height - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+    Require(DescribeSurface(DecodeTextureResource(texture)).guestBytes <= sizeof(texels), "the draw snapshot table set test T# reads past its texels");
     constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
     const auto addTable = [&](ShaderRecompiler::RecompileResult& program, ShaderRecompiler::RuntimeAbi::Stage stage, std::uint32_t set, std::uint32_t elements) {
         ShaderRecompiler::DescriptorBinding map{};
@@ -3889,6 +3888,19 @@ void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorde
     ClearCachedTextures(context.device);
 }
 
+bool waitForWatchedImport(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (HostImportFor(context, address, bytes) == nullptr) return false;
+#ifdef _WIN32
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr || std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (HostImportFor(context, address, bytes) == nullptr) return false;
+    }
+#endif
+    return AgcDriver::GuestMemory::Watched(address, bytes);
+}
+
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
@@ -3922,7 +3934,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
         return;
     }
-    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+    if (!waitForWatchedImport(context, address, bytes)) {
         std::cout << "host imports are compared, not watched: draw snapshot reuse not tested\n";
         return;
     }
@@ -3979,6 +3991,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     recorder.Activate();
+    std::cout << "Draw snapshot reuse tests passed\n";
 }
 
 void drawSnapshotPatchTests(const Device& device) {
@@ -4016,7 +4029,7 @@ void drawSnapshotPatchTests(const Device& device) {
         std::cout << "host import of the watched block refused: snapshot patching not tested\n";
         return;
     }
-    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+    if (!waitForWatchedImport(context, address, bytes)) {
         std::cout << "host imports are compared, not watched: snapshot patching not tested\n";
         return;
     }
@@ -4086,6 +4099,7 @@ void drawSnapshotPatchTests(const Device& device) {
         Require(std::memcmp(held->Bytes().data(), before.data(), before.size()) == 0, "a held snapshot's bytes changed");
         snapshotRecorder.Sync();
     }
+    std::cout << "Draw snapshot patch tests passed\n";
 }
 
 void drawSnapshotEpochTests(const Device& device) {
@@ -6615,7 +6629,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+    if (!waitForWatchedImport(base, address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
         return;
     }
@@ -6700,6 +6714,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
     }
     recorder.Sync();
+    std::cout << "Storage refresh proof tests passed\n";
 }
 
 
