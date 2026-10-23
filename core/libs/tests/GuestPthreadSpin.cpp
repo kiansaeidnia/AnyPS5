@@ -18,8 +18,8 @@ int APS5_VABI pthread_spin_unlock_nid_postfix(PthreadSpinlock* lock);
 static constexpr int GUEST_EPERM = 1;
 static constexpr int GUEST_EBUSY = 16;
 static constexpr int GUEST_EINVAL = 22;
-static constexpr int PTHREAD_PROCESS_PRIVATE = 0;
-static constexpr int PTHREAD_PROCESS_SHARED = 1;
+static constexpr int GuestProcessPrivate = 0;
+static constexpr int GuestProcessShared = 1;
 static constexpr int Increments = 200000;
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -49,9 +49,9 @@ static void* APS5_VABI Incrementer(void* arg) {
 }
 
 static void ArgumentErrors() {
-    Require(pthread_spin_init_nid_postfix(nullptr, PTHREAD_PROCESS_PRIVATE) == GUEST_EINVAL);
+    Require(pthread_spin_init_nid_postfix(nullptr, GuestProcessPrivate) == GUEST_EINVAL);
     PthreadSpinlock lock = nullptr;
-    Require(pthread_spin_init_nid_postfix(&lock, PTHREAD_PROCESS_SHARED) == GUEST_EINVAL);
+    Require(pthread_spin_init_nid_postfix(&lock, GuestProcessShared) == GUEST_EINVAL);
     Require(pthread_spin_init_nid_postfix(&lock, 2) == GUEST_EINVAL);
     Require(pthread_spin_init_nid_postfix(&lock, -1) == GUEST_EINVAL);
     Require(lock == nullptr);
@@ -90,7 +90,7 @@ static void SingleThread(int pshared) {
 
 static void HeldByAnotherThread() {
     Shared shared;
-    Require(pthread_spin_init_nid_postfix(&shared.lock, PTHREAD_PROCESS_PRIVATE) == 0);
+    Require(pthread_spin_init_nid_postfix(&shared.lock, GuestProcessPrivate) == 0);
     Require(pthread_spin_lock_nid_postfix(&shared.lock) == 0);
     Pthread thread = nullptr;
     Require(scePthreadCreate(&thread, nullptr, Contender, &shared, nullptr) == 0);
@@ -103,7 +103,7 @@ static void HeldByAnotherThread() {
 
 static void MutualExclusion() {
     Shared shared;
-    Require(pthread_spin_init_nid_postfix(&shared.lock, PTHREAD_PROCESS_PRIVATE) == 0);
+    Require(pthread_spin_init_nid_postfix(&shared.lock, GuestProcessPrivate) == 0);
     Pthread first = nullptr;
     Pthread second = nullptr;
     Require(scePthreadCreate(&first, nullptr, Incrementer, &shared, nullptr) == 0);
@@ -116,7 +116,7 @@ static void MutualExclusion() {
 
 int main() {
     ArgumentErrors();
-    SingleThread(PTHREAD_PROCESS_PRIVATE);
+    SingleThread(GuestProcessPrivate);
     HeldByAnotherThread();
     MutualExclusion();
 }

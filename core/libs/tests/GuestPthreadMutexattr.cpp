@@ -29,7 +29,7 @@ static constexpr int GUEST_EINVAL = 22;
 static constexpr int PRIO_NONE = 0;
 static constexpr int PRIO_INHERIT = 1;
 static constexpr int PRIO_PROTECT = 2;
-static constexpr int SCHED_RR = 3;
+static constexpr int GuestSchedRoundRobin = 3;
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -143,7 +143,7 @@ int main() {
     Require(pthread_mutexattr_setprioceiling_nid_postfix(&attr, 300) == GUEST_EINVAL);
     Require(pthread_mutexattr_setprotocol_nid_postfix(&attr, PRIO_PROTECT) == 0);
     Require(pthread_mutexattr_getprotocol_nid_postfix(&attr, &protocol) == 0 && protocol == PRIO_PROTECT);
-    Require(pthread_mutexattr_getprioceiling_nid_postfix(&attr, &ceiling) == 0 && ceiling == sched_get_priority_max_nid_postfix(SCHED_RR));
+    Require(pthread_mutexattr_getprioceiling_nid_postfix(&attr, &ceiling) == 0 && ceiling == sched_get_priority_max_nid_postfix(GuestSchedRoundRobin));
     Require(pthread_mutexattr_setprioceiling_nid_postfix(&attr, 300) == 0);
     Require(pthread_mutexattr_getprioceiling_nid_postfix(&attr, &ceiling) == 0 && ceiling == 300);
     PthreadMutex mutex = nullptr;
@@ -153,7 +153,7 @@ int main() {
     Require(pthread_mutex_destroy_nid_postfix(&mutex) == 0);
     Require(pthread_mutexattr_setprotocol_nid_postfix(&attr, PRIO_PROTECT) == 0);
     Require(pthread_mutexattr_getprotocol_nid_postfix(&attr, &protocol) == 0 && protocol == PRIO_PROTECT);
-    Require(pthread_mutexattr_getprioceiling_nid_postfix(&attr, &ceiling) == 0 && ceiling == sched_get_priority_max_nid_postfix(SCHED_RR));
+    Require(pthread_mutexattr_getprioceiling_nid_postfix(&attr, &ceiling) == 0 && ceiling == sched_get_priority_max_nid_postfix(GuestSchedRoundRobin));
     Require(pthread_mutexattr_setprotocol_nid_postfix(&attr, PRIO_NONE) == 0);
     Require(pthread_mutexattr_getprotocol_nid_postfix(&attr, &protocol) == 0 && protocol == PRIO_NONE);
     Require(pthread_mutexattr_getprioceiling_nid_postfix(&attr, &ceiling) == GUEST_EINVAL);
