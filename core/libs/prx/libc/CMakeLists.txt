@@ -1,5 +1,12 @@
 if(BUILD_TESTING)
     if(WIN32)
+        add_test_executable(windows_host_allocation_tests ${LIBS_INCLUDE_DIR}/tests/WindowsHostAllocation.cpp)
+        target_link_libraries(windows_host_allocation_tests PRIVATE libc)
+        configure_windows_unwind(windows_host_allocation_tests)
+        add_test(NAME windows_host_allocation COMMAND windows_host_allocation_tests)
+        set_tests_properties(windows_host_allocation PROPERTIES TIMEOUT 20
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+
         add_test_executable(windows_mappings_release_tests ${LIBS_INCLUDE_DIR}/tests/WindowsMappingsRelease.cpp)
         target_include_directories(windows_mappings_release_tests PRIVATE ${LIBS_INCLUDE_DIR})
         target_link_libraries(windows_mappings_release_tests PRIVATE libc)
@@ -43,6 +50,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FailureReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/HostAllocation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/x86_64/CallTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
