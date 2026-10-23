@@ -585,6 +585,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_dir.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_module_directories COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_directories.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_symbolic COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_symbolic.py $<TARGET_FILE:relinker>)
+        set_tests_properties(guest_symbolic PROPERTIES TIMEOUT 30)
         add_test(NAME relinker_executables COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_executables.py $<TARGET_FILE:relinker>)
         add_test(NAME game_patches COMMAND ${Python3_EXECUTABLE}
