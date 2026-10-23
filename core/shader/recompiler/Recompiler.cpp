@@ -169,7 +169,7 @@ struct PreparedControlFlow {
 
     bool Matches(const RecompileRequest& request, const SwappcInfo& swappcInfo) const {
         return stage == request.shader.stage && mergedHull == MergedHullStage(request) && swappc.fetchCallAllowed == swappcInfo.fetchCallAllowed &&
-               swappc.userDataBaseRegister == swappcInfo.userDataBaseRegister && swappc.userDataCount == swappcInfo.userDataCount &&
+               swappc.userDataBaseRegister == swappcInfo.userDataBaseRegister && swappc.userDataCount == swappcInfo.userDataCount && swappc.waveSize == swappcInfo.waveSize &&
                std::ranges::equal(fallbacks, swappcInfo.linkedCallFallbacks) && std::ranges::equal(code, request.shader.code);
     }
 
@@ -189,7 +189,7 @@ struct PreparedControlFlow {
 
 std::shared_ptr<const PreparedControlFlow> ShaderPreparationContext::AcquireFrontend(const RecompileRequest& request) {
     const auto inputInfo = RequestInputInfo(request);
-    const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), 0u, request.context.linkedCallFallbacks};
+    const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize, request.context.linkedCallFallbacks};
     static const bool reuse = std::getenv("APS5_NO_PERF_FRONTEND_PAIR") == nullptr;
     if (reuse && frontend != nullptr && frontend->Matches(request, swappc)) {
         return frontend;

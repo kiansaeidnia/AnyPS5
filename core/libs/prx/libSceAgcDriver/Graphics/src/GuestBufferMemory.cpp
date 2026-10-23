@@ -1547,6 +1547,7 @@ std::string budgetSource(const Context& context, const HostImports& state, std::
 }
 
 std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
+std::atomic<std::uint64_t> importMaxBytes{0};
 
 // The import of an access to a registered range larger than the range window: the cells the access touches, grown to
 // the union of the range's imports it overlaps, so accesses across neighbouring cell edges share one import instead of
@@ -1654,6 +1655,32 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     return importRunAt(context, state, std::move(run), false, address, lease, end, evict, requester);
 }
 
+struct ImportPiece {
+    std::uint64_t begin;
+    std::uint64_t end;
+    const HostImport* entry;
+};
+
+std::vector<ImportPiece> importPieces(const Context& context, HostImports& state, const GuestAllocations::Range& range, const GuestAllocations::Lease& lease) {
+    const auto limit = importMaxBytes.load(std::memory_order_relaxed);
+    const auto window = rangeImportWindow.load(std::memory_order_relaxed);
+    const auto alignment = context.hostImportAlignment;
+    if (limit < 2 * window || window == 0 || alignment == 0 || window % alignment != 0 || range.address % alignment != 0) return {};
+    const auto step = (limit / window - 1) * window;
+    const auto end = range.address + range.bytes;
+    std::vector<ImportPiece> pieces;
+    for (auto cursor = range.address; cursor < end;) {
+        const auto wanted = end - cursor < step + window ? end : cursor + step;
+        const auto* entry = importAllocation(context, state, cursor, lease, ImportRequester::Build, wanted, false);
+        if (entry == nullptr || entry->base > cursor || entry->bytes > limit) return {};
+        const auto to = std::min(end, entry->base + entry->bytes);
+        if (to <= cursor) return {};
+        pieces.push_back({cursor, to, entry});
+        cursor = to;
+    }
+    return pieces;
+}
+
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
     if (const auto* low = peekImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
     if (const auto* high = peekImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
@@ -1683,6 +1710,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return &found->second;
     }
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
+    if (const auto limit = importMaxBytes.load(std::memory_order_relaxed); limit != 0 && bytes > limit) return nullptr;
     if (const auto failed = failures.find(base); !stepDown && failed != failures.end()) {
         if (sameRun(failed->second, run)) return nullptr;
         failures.erase(failed);
@@ -3501,6 +3529,10 @@ void SetHostImportRangeWindow(std::uint64_t bytes) {
     rangeImportWindow.store(bytes, std::memory_order_relaxed);
 }
 
+void SetHostImportMaxBytes(std::uint64_t bytes) {
+    importMaxBytes.store(bytes, std::memory_order_relaxed);
+}
+
 void SetHostImportBudget(std::uint64_t bytes) {
     budgetOverride.store(bytes, std::memory_order_relaxed);
     auto& state = Imports();
@@ -3864,8 +3896,14 @@ void GuestBufferMemory::AcquireRegistered() {
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
+            std::vector<ImportPiece> pieces;
+            const auto limit = importMaxBytes.load(std::memory_order_relaxed);
             if (importable && covering != nullptr && range->address >= coveredBegin && range->address + range->bytes <= coveredEnd) {
                 entry = covering;
+            } else if (importable && limit != 0 && range->bytes > limit) {
+                auto& state = Imports();
+                std::lock_guard lock(state.mutex);
+                pieces = importPieces(context, state, *range, lease);
             } else if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
@@ -3877,6 +3915,16 @@ void GuestBufferMemory::AcquireRegistered() {
                 }
             }
             lap(timing.importsUs, at);
+            if (!pieces.empty()) {
+                for (const auto& piece : pieces) {
+                    Region part{piece.begin, piece.end, range->writable, {}, nullptr};
+                    part.hostBacked = true;
+                    part.direct = piece.entry;
+                    regions.push_back(std::move(part));
+                }
+                imported.push_back(range->address);
+                continue;
+            }
             if (entry != nullptr) {
                 region.hostBacked = true;
                 // Reused by Upload while no import was dropped since (see importsEpoch).

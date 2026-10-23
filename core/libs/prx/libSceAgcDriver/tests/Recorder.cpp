@@ -1,3 +1,4 @@
+#include "prx/libSceAgc/Command/include/Packet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
@@ -1837,6 +1838,16 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     Require(words[0] == 1 && words[1] == 2 && words[2] == 5 && words[4] == 4 && words[3] == 0, "the stores did not land (or the later store of a dword lost)");
     const auto after = Recorder::StoreCounts();
     Require(after.stores == before.stores + 1 && after.replaced == before.replaced + 0 && after.joined == before.joined + 0, "store counters are off");
+    store(8, 1);
+    recorder.NotePendingWrite(address + 32, 4);
+    auto* commandWords = static_cast<std::uint32_t*>(block);
+    CommandBuffer disjoint{commandWords + 12, commandWords + 16, commandWords + 12, nullptr, nullptr, nullptr, 0};
+    Agc::Command::Emit(&disjoint, 0x7a, {0x20000243, 0x400}, __func__);
+    Require(recorder.Recording(), "a disjoint command allocation drained the GPU store");
+    CommandBuffer reused{commandWords + 6, commandWords + 10, commandWords + 6, nullptr, nullptr, nullptr, 0};
+    Agc::Command::Emit(&reused, 0x7a, {0x20000243, 0x400}, __func__);
+    recorder.Sync();
+    Require(words[8] == 0x400, "a pending GPU label overwrote a reused command word");
     // The covered-access mask: reported once by the next Commands() call, then cleared.
     VkAccessFlags covered = 0xffffffffu;
     recorder.Commands(&covered);
@@ -7418,35 +7429,7 @@ public:
         const auto commands = start.commands;
         if (!continued) {
             recorder.PrepareSampleSlot();
-            if (context.graphicsPipelineLibrary) {
-                if (!transitioned) {
-                    transitioned = true;
-                    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    barrier.image = target.Image();
-                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-                }
-                VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-                attachment.imageView = target.View();
-                attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-                attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
-                rendering.renderArea = {{0, 0}, {8, 8}};
-                rendering.layerCount = 1;
-                rendering.colorAttachmentCount = 1;
-                rendering.pColorAttachments = &attachment;
-                context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-            } else {
-                VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-                begin.renderPass = renderPass;
-                begin.framebuffer = framebuffer;
-                begin.renderArea = {{0, 0}, {8, 8}};
-                context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-            }
+            begin(commands);
         }
         context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         recorder.NoteSampledDraw(commands);
@@ -7455,10 +7438,48 @@ public:
         return continued;
     }
 
+    void Record(VkCommandBuffer commands) const {
+        begin(commands);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        context.Function<PFN_vkCmdDraw>("vkCmdDraw")(commands, 3, 1, 0, 0);
+        EndRenderPass(context, commands);
+    }
+
     static constexpr std::uint64_t Samples = 64;
 
 private:
     static constexpr std::uint64_t PassKey = 0xc0de;
+    void begin(VkCommandBuffer commands) const {
+        if (context.graphicsPipelineLibrary) {
+            if (!transitioned) {
+                transitioned = true;
+                VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier.image = target.Image();
+                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            }
+            VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+            attachment.imageView = target.View();
+            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+            rendering.renderArea = {{0, 0}, {8, 8}};
+            rendering.layerCount = 1;
+            rendering.colorAttachmentCount = 1;
+            rendering.pColorAttachments = &attachment;
+            context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+        } else {
+            VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            info.renderPass = renderPass;
+            info.framebuffer = framebuffer;
+            info.renderArea = {{0, 0}, {8, 8}};
+            context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &info, VK_SUBPASS_CONTENTS_INLINE);
+        }
+    }
     void release() noexcept {
         const auto device = context.device;
         if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device, pipeline, nullptr);
@@ -7804,6 +7825,24 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     }
     CoverPass cover(context);
     inPassSampleDumpTests(recorder, context, cover, words, address, target);
+}
+
+void uncountedPassTests(const Device& device) {
+    auto context = device.GetContext();
+    context.bufferDeviceAddress = false;
+    Recorder recorder(context);
+    CoverPass cover(context);
+    recorder.CountSamples();
+    Require(!recorder.QueuesSampleDumps(), "a recorder without buffer device addresses counted samples in segments");
+    const auto base = recorder.SamplesTotal();
+    cover.Draw(recorder);
+    recorder.RecordUncounted([&](VkCommandBuffer commands) { cover.Record(commands); });
+    cover.Draw(recorder);
+    recorder.Submit();
+    recorder.Sync();
+    const auto counted = recorder.SamplesTotal() - base;
+    Require(counted != 0, "the draws around an uncounted pass were not counted");
+    if (context.occlusionQueryPrecise) Require(counted == 2 * CoverPass::Samples, "the batch-wide occlusion query counted " + std::to_string(counted) + " samples, not the " + std::to_string(2 * CoverPass::Samples) + " of the two draws around an uncounted pass");
 }
 
 void cmaskPassTests(const Device& device, Recorder& recorder) {
@@ -10601,6 +10640,12 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
+            if (device.GetContext().hostImportAlignment == 0) return 77;
+            const auto before = Recorder::StoreCounts().stores;
+            storeRunTests(device, recorder);
+            return Recorder::StoreCounts().stores != before ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
@@ -10800,6 +10845,15 @@ int main(int argc, char** argv) {
             }
             sampleDumpTests(device, recorder);
             std::cout << "Occlusion counter dump tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--uncounted-passes-only") {
+            if (!device.Graphics()) {
+                std::cout << "skipped, the test queue has no graphics\n";
+                return 77;
+            }
+            uncountedPassTests(device);
+            std::cout << "Uncounted pass tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--shadowed-key-stores-only") {
