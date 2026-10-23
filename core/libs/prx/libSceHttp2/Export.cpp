@@ -360,7 +360,7 @@ int APS5_VABI sceHttp2CreateCookieBox(std::size_t poolSize) {
     if (poolSize < 0x10000) return static_cast<int>(0x817b121du);
     if (poolSize > std::numeric_limits<std::size_t>::max() - 0x3fff) throw std::overflow_error("sceHttp2CreateCookieBox: pool size overflow");
     const auto allocationSize = (poolSize + 0x3fff) & ~std::size_t{0x3fff};
-    auto memory = std::make_shared<std::byte[]>(allocationSize);
+    std::shared_ptr<std::byte[]> memory = std::make_unique<std::byte[]>(allocationSize);
     std::lock_guard lock(g_handlesMutex);
     const int id = g_nextHandle.fetch_add(1, std::memory_order_relaxed);
     g_handles[id] = {Http2Kind::CookieBox, 0, poolSize, std::move(memory)};
