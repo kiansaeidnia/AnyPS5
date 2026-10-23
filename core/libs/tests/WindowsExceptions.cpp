@@ -136,7 +136,14 @@ static void testUnhandledThrowSite() {
     __builtin_unreachable();
 }
 
+static LONG WINAPI ExitAfterTrapReport(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    TerminateProcess(GetCurrentProcess(), info->ExceptionRecord->ExceptionCode);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static int RunAbortChild() {
+    RequireHandle(AddVectoredExceptionHandler(0, ExitAfterTrapReport) != nullptr);
     std::fprintf(stderr, "abort probe\n");
     std::fflush(stderr);
     GuestAbortProbe();
@@ -157,6 +164,7 @@ static void testGuestAbortReport() {
 }
 
 static int RunAssertChild() {
+    RequireHandle(AddVectoredExceptionHandler(0, ExitAfterTrapReport) != nullptr);
     std::fprintf(stderr, "assert probe\n");
     std::fflush(stderr);
     GuestAssertProbe();
