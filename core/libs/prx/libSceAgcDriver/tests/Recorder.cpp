@@ -107,6 +107,19 @@ void* AllocateWatched(std::size_t bytes, std::size_t alignment) {
     return block;
 }
 
+bool waitForWatchedImport(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (HostImportFor(context, address, bytes) == nullptr) return false;
+#ifdef _WIN32
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr || std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (HostImportFor(context, address, bytes) == nullptr) return false;
+    }
+#endif
+    return AgcDriver::GuestMemory::Watched(address, bytes);
+}
+
 void ReleaseWatched(void* block, std::size_t bytes) {
 #ifdef _WIN32
     GuestArena::GuestArenaReset_nid_postfix(block, bytes);
@@ -3813,7 +3826,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
         return;
     }
-    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+    if (!waitForWatchedImport(context, address, bytes)) {
         std::cout << "host imports are compared, not watched: draw snapshot reuse not tested\n";
         return;
     }
@@ -3870,6 +3883,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     recorder.Activate();
+    std::cout << "Draw snapshot reuse tests passed\n";
 }
 
 void drawSnapshotPatchTests(const Device& device) {
@@ -3907,7 +3921,7 @@ void drawSnapshotPatchTests(const Device& device) {
         std::cout << "host import of the watched block refused: snapshot patching not tested\n";
         return;
     }
-    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+    if (!waitForWatchedImport(context, address, bytes)) {
         std::cout << "host imports are compared, not watched: snapshot patching not tested\n";
         return;
     }
@@ -3977,6 +3991,7 @@ void drawSnapshotPatchTests(const Device& device) {
         Require(std::memcmp(held->Bytes().data(), before.data(), before.size()) == 0, "a held snapshot's bytes changed");
         snapshotRecorder.Sync();
     }
+    std::cout << "Draw snapshot patch tests passed\n";
 }
 
 void drawSnapshotEpochTests(const Device& device) {
@@ -6506,7 +6521,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+    if (!waitForWatchedImport(base, address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
         return;
     }
@@ -6591,6 +6606,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
     }
     recorder.Sync();
+    std::cout << "Storage refresh proof tests passed\n";
 }
 
 
