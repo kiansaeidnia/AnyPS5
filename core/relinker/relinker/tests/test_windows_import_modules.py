@@ -521,13 +521,15 @@ def main():
             run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
             assert run.returncode == 11, (run.returncode, run.stdout, run.stderr)
 
-        for symbol, message in [('shared#A#C', 'Unknown import module ID'),
-                                ('shared#A#', 'Invalid qualified import'),
-                                ('shared#A#?', 'Invalid import module ID'),
-                                ('shared#A#BBBBBBBB', 'Invalid import module ID')]:
-            result, output = convert(symbol.replace('?', 'invalid'), 'b.prx', symbol)
-            assert result.returncode == 2 and message in result.stderr, result.stderr
-            assert not output.exists()
+        for prefix in ('shared', 'long_import_symbol'):
+            for suffix, message in [('#A#C', 'Unknown import module ID'),
+                                    ('#A#', 'Invalid qualified import'),
+                                    ('#A#?', 'Invalid import module ID'),
+                                    ('#A#BBBBBBBB', 'Invalid import module ID')]:
+                symbol = prefix + suffix
+                result, output = convert(symbol.replace('?', 'invalid'), 'b.prx', symbol)
+                assert result.returncode == 2 and message in result.stderr, result.stderr
+                assert not output.exists()
 
         result, output = convert('legacy', 'b.prx', 'shared', guest_owner='b.prx')
         assert result.returncode == 2 and 'Ambiguous guest import' in result.stderr, result.stderr
