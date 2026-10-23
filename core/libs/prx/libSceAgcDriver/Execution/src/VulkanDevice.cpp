@@ -359,6 +359,7 @@ struct VulkanDevice::State {
     bool meshShader = false;
     bool fragmentShaderBarycentric = false;
     bool shaderTerminateInvocation = false;
+    bool fusedExactArithmetic = false;
     bool geometryShader = false;
     bool largePoints = false;
     bool sampleRateShading = false;
@@ -1261,6 +1262,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         driverId = driver.driverID;
         state->driverInfo = std::string(driver.driverName) + " " + driver.driverInfo;
         state->individuallyFreeDescriptorSets = driver.driverID == VK_DRIVER_ID_MESA_LLVMPIPE;
+        state->fusedExactArithmetic = driver.driverID == VK_DRIVER_ID_MOLTENVK;
         state->subgroupControlBarriers = SubgroupControlBarrierUsable(driver.driverID);
     }
     auto byteFeatures = QueryBdaByteFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
@@ -3753,6 +3755,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     require(state->shaderProfile != nullptr, "shader device profile is unavailable");
     auto target = state->shaderProfile->Target();
     target.float32FlushToZero = state->float32FlushToZero;
+    target.fusedExactArithmetic = state->fusedExactArithmetic;
     target.float32DenormPreserve = state->float32DenormPreserve;
     return target;
 }
@@ -3893,6 +3896,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.graphicsPipelineLibrary = state->graphicsPipelineLibrary;
     context.pipelineLinkTimeOptimization = state->pipelineLinkTimeOptimization;
     context.drawInputsInPlace = state->drawInputsInPlace;
+    context.discreteGpu = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     context.provokingVertexModePerPipeline = state->provokingVertexModePerPipeline;
     context.drawIndirectCount = state->drawIndirectCount;
     context.occlusionQueryPrecise = state->occlusionQueryPrecise;

@@ -911,8 +911,10 @@ void importMappedFailureGenerationTests(const Context& context) {
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         Require(ImportMappedRanges(range.importing, mapped, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true), "the replacement owner map import was deferred");
-        Require(probe.calls.size() == 2u, "a replacement owner did not retry its predecessor's failed import");
+        Require(probe.calls.size() == 1u, "a replacement owner was imported again at map instead of on first use");
     }
+    HostImportFor(range.importing, range.First(), range.bytes);
+    Require(probe.calls.size() == 2u, "a replacement owner did not retry its predecessor's failed import on first use");
     ClearHostImports(context.device);
 }
 
@@ -1050,6 +1052,7 @@ void importNeighbouringEdgesTests(const Context& context) {
 // A range mapped while the imports are at the budget is refused at map time without retiring an import: the map
 // observer holds no GPU lock, so it must not evict (before, it evicted the least recently used import to fit).
 void importAtMapOverBudgetTests(const Context& context) {
+    ClearHostImports(context.device);
     constexpr std::size_t bytes = 65536;
     auto importing = context;
     importing.hostImportAlignment = bytes;
@@ -1094,6 +1097,7 @@ void importAtMapOverBudgetTests(const Context& context) {
 }
 
 void importRequesterTests(const Context& context, const BdaTestAccess& access) {
+    ClearHostImports(context.device);
     constexpr std::size_t piece = 65536;
     constexpr std::size_t pieces = 8;
     auto* block = static_cast<std::uint8_t*>(::operator new(pieces * piece, std::align_val_t{piece}));

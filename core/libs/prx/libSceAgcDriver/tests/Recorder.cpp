@@ -384,6 +384,7 @@ public:
                 VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hostProperties};
                 function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &properties);
                 context.hostImportAlignment = hostProperties.minImportedHostPointerAlignment;
+                context.discreteGpu = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
             }
             if (driverProperties.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY && hasExtension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) && hasExtension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
                 extensionsEnabled.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
@@ -3238,7 +3239,7 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         std::cout << "host imports unavailable: read and written staging not tested\n";
         return false;
     }
-    constexpr std::size_t bytes = 8u << 20u;
+    constexpr std::size_t bytes = 16u << 20u;
 #ifdef _WIN32
     void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
@@ -3268,11 +3269,12 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         return direct;
     };
     Require(!boundInPlace(address + 4096, 1u << 20u, false), "a written 1 MiB element was not staged");
-    Require(boundInPlace(address + 4096, 4u << 20u, false), "a written-only 4 MiB element was staged past the written window");
+    Require(boundInPlace(address + 4096, 4u << 20u, false) != context.discreteGpu, context.discreteGpu ? "a written-only 4 MiB element was bound in place on a discrete GPU" : "a written-only 4 MiB element was staged past the written window");
+    Require(boundInPlace(address + 4096, 12u << 20u, false), "a written-only 12 MiB element was staged past the discrete written window");
     Require(!boundInPlace(address + 4096, 4u << 20u, true), "a read and written 4 MiB element was bound in place");
     const auto buildInPlace = [&](std::uint64_t dispatchThreads, bool read, std::uint32_t stride, std::uint32_t extent) {
         const auto element = address + 4096;
-        constexpr std::uint32_t elementBytes = 4u << 20u;
+        constexpr std::uint32_t elementBytes = 12u << 20u;
         const std::uint32_t records = stride != 0 ? elementBytes / stride : elementBytes;
         ShaderRecompiler::RecompileResult program;
         ShaderRecompiler::DescriptorBinding binding;
@@ -3294,13 +3296,13 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
         return direct;
     };
-    Require(!buildInPlace((4u << 20u) / 16u, true, 16, 0), "a dispatch sweeping a read and written 4 MiB element bound it in place");
-    Require(buildInPlace(1024, true, 16, 0), "a dispatch touching 16 KiB of a read and written 4 MiB element staged all of it");
-    Require(buildInPlace(0, true, 16, 0), "a dispatch of unknown size staged a read and written 4 MiB element");
-    Require(buildInPlace((4u << 20u) / 16u, false, 16, 0), "a dispatch sweeping a written-only 4 MiB element staged it");
-    Require(!buildInPlace((4u << 20u) / 32u, true, 0, 32), "a dispatch sweeping a read and written 4 MiB raw element bound it in place");
-    Require(buildInPlace(1024, true, 0, 32), "a dispatch touching 32 KiB of a read and written 4 MiB raw element staged all of it");
-    Require(buildInPlace((4u << 20u) / 32u, true, 0, 0), "a raw element without an access extent was staged");
+    Require(!buildInPlace((12u << 20u) / 16u, true, 16, 0), "a dispatch sweeping a read and written 12 MiB element bound it in place");
+    Require(buildInPlace(1024, true, 16, 0), "a dispatch touching 16 KiB of a read and written 12 MiB element staged all of it");
+    Require(buildInPlace(0, true, 16, 0), "a dispatch of unknown size staged a read and written 12 MiB element");
+    Require(buildInPlace((12u << 20u) / 16u, false, 16, 0), "a dispatch sweeping a written-only 12 MiB element staged it");
+    Require(!buildInPlace((12u << 20u) / 32u, true, 0, 32), "a dispatch sweeping a read and written 12 MiB raw element bound it in place");
+    Require(buildInPlace(1024, true, 0, 32), "a dispatch touching 32 KiB of a read and written 12 MiB raw element staged all of it");
+    Require(buildInPlace((12u << 20u) / 32u, true, 0, 0), "a raw element without an access extent was staged");
     Require(std::all_of(static_cast<const std::byte*>(block), static_cast<const std::byte*>(block) + bytes, [](std::byte value) { return value == std::byte{0x11}; }), "a staged copy-back changed the guest bytes");
     {
         GuestAllocations::Mutation mutation;

@@ -1244,6 +1244,10 @@ int APS5_VABI getdirentries_nid_postfix(int fd, char* buf, int nbytes, int64_t* 
     return PosixResult(sceKernelGetdirentries(fd, buf, nbytes, basep));
 }
 
+int APS5_VABI _getdirentries_nid_postfix(int fd, char* buf, int nbytes, int64_t* basep) {
+    return getdirentries_nid_postfix(fd, buf, nbytes, basep);
+}
+
 int APS5_VABI getdents_nid_postfix(int fd, char* buf, int nbytes) {
     return PosixResult(sceKernelGetdents(fd, buf, nbytes));
 }
