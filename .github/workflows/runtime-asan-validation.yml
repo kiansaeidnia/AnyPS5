@@ -20,8 +20,8 @@ jobs:
       run:
         shell: bash
     env:
-      SOURCE_COMMIT: fdf198d764bd2b17d78404c34aa1d1e7715fc9cb
-      FOCUSED_TESTS: '^(atomic_shared_ptr.*|guest_http2|agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$'
+      SOURCE_COMMIT: 3db508f3ae3c34807a81523382a658429009a143
+      FOCUSED_TESTS: '^(atomic_shared_ptr.*|guest_http2|guest_pthread_(spin|mutexattr)|agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$'
       ANYPS5_REQUIRE_VULKAN: '1'
       ANYPS5_NO_SHADER_CACHE: '1'
       VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
