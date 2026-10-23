@@ -1,0 +1,195 @@
+name: Runtime ASan validation
+
+on:
+  push:
+    branches: [validate/linux-runtime-asan]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-asan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime:
+    if: github.repository == 'kiansaeidnia/AnyPS5'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_COMMIT: 9769b07ecebc822b27fce8d28391a347a44945fc
+      ANYPS5_REQUIRE_VULKAN: '1'
+      ANYPS5_NO_SHADER_CACHE: '1'
+      VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+      VK_LOADER_DEBUG: warn,layer
+      GALLIUM_OVERRIDE_CPU_CAPS: avx
+    steps:
+      - name: Prepare hosted build space
+        shell: bash
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h .
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Install build and Vulkan dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake ninja-build gcc-11 g++-11 python3 python3-yaml pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxinerama-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl-dev libgl-dev libdbus-1-dev \
+            libudev-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libdecor-0-dev \
+            libvulkan1 vulkan-tools vulkan-validationlayers mesa-vulkan-drivers xvfb xauth
+      - name: Record source, toolchain and Vulkan environment
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mkdir -p build
+          git submodule status --recursive > build/submodules.txt
+          gcc-11 --version > build/compiler.txt
+          cmake --version > build/cmake.txt
+          python3 --version > build/python.txt
+          node --version > build/node.txt
+          git --version > build/git.txt
+          dpkg-query -W mesa-vulkan-drivers vulkan-validationlayers > build/vulkan-packages.txt
+          find /usr/share/vulkan/icd.d -maxdepth 1 -name '*lvp*.json' > build/lavapipe-paths.txt
+          test "$(wc -l < build/lavapipe-paths.txt)" -eq 1
+          echo "VK_ICD_FILENAMES=$(cat build/lavapipe-paths.txt)" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          report = {
+              "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "runner": os.environ["RUNNER_NAME"],
+              "compiler": subprocess.check_output(["g++-11", "-dumpfullversion"], text=True).strip(),
+              "build_type": "RelWithDebInfo",
+              "asan": True,
+          }
+          Path("build/identity.json").write_text(json.dumps(report, indent=2) + "\n")
+          PY
+      - name: Probe Vulkan and its validation layer
+        run: vulkaninfo --summary 2>&1 | tee build/vulkaninfo.log
+      - name: Configure the complete sanitizer build
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
+            -DPython3_EXECUTABLE=/usr/bin/python3 \
+            -DANYPS5_ENABLE_ASAN=ON -DANYPS5_ENABLE_SPIRV_TOOLS=OFF \
+            2>&1 | tee build/configure.log
+          python3 tools/check_test_registration.py build
+          ctest --test-dir build --show-only=json-v1 > build/test-inventory.json
+          ctest --test-dir build --show-only=json-v1 \
+            -R '^(agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$' \
+            > build/focused-inventory.json
+      - name: Build all targets
+        id: build
+        run: cmake --build build --parallel 2 2>&1 | tee build/build.log
+      - name: Build patched runtime libraries
+        id: libs
+        run: cmake --build build --target libs --parallel 2 2>&1 | tee build/libs.log
+      - name: Run focused runtime checks
+        id: focused
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          xvfb-run -a ctest --test-dir build --parallel 1 --timeout 30 --no-tests=error -V \
+            -R '^(agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$' \
+            --output-junit "$GITHUB_WORKSPACE/build/focused.xml" \
+            --output-log "$GITHUB_WORKSPACE/build/focused.log"
+          result=$?
+          printf '%s\n' "$result" > build/focused.exit
+          exit "$result"
+      - name: Run the complete runtime suite
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          xvfb-run -a ctest --test-dir build --parallel 2 --timeout 30 --no-tests=error -V \
+            --output-junit "$GITHUB_WORKSPACE/build/ctest.xml" \
+            --output-log "$GITHUB_WORKSPACE/build/ctest.log"
+          result=$?
+          printf '%s\n' "$result" > build/ctest.exit
+          exit "$result"
+      - name: Audit complete coverage and runtime diagnostics
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.libs.outcome == 'success' }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          build = Path("build")
+          def summarize(stem, inventory_name):
+              inventory = json.loads((build / inventory_name).read_text())
+              expected = {test["name"] for test in inventory["tests"]}
+              cases = list(ET.parse(build / (stem + ".xml")).getroot().iter("testcase"))
+              names = [case.attrib["name"] for case in cases]
+              failures = [case.attrib["name"] for case in cases if case.find("failure") is not None or case.find("error") is not None]
+              skips = [case.attrib["name"] for case in cases if case.find("skipped") is not None]
+              log = (build / (stem + ".log")).read_text(errors="replace")
+              result = {
+                  "registered": len(expected),
+                  "selected": len(cases),
+                  "passed": len(cases) - len(failures) - len(skips),
+                  "failures": failures,
+                  "skips": skips,
+                  "disabled": [case.attrib["name"] for case in cases if case.get("status") == "disabled"],
+                  "missing": sorted(expected - set(names)),
+                  "unexpected": sorted(set(names) - expected),
+                  "raw_vuids": sorted(set(re.findall(r"VUID-[A-Za-z0-9_-]+", log))),
+                  "validation_layer_loads": len(re.findall(r'Insert instance layer "?VK_LAYER_KHRONOS_validation(?:"|\s)', log)),
+                  "missing_requested_validation_layer": "was not found but was requested by env var VK_INSTANCE_LAYERS" in log,
+                  "sanitizer_diagnostics": sorted(set(re.findall(r"(?:(?:ERROR|SUMMARY): (?:AddressSanitizer|LeakSanitizer)|AddressSanitizer:DEADLYSIGNAL)[^\n]*", log))),
+                  "over_30_seconds": {case.attrib["name"]: float(case.attrib.get("time", "0")) for case in cases if float(case.attrib.get("time", "0")) > 30},
+                  "ctest_exit_code": int((build / (stem + ".exit")).read_text()),
+              }
+              valid = bool(cases) and len(names) == len(set(names)) and result["ctest_exit_code"] == 0
+              valid = valid and not any(result[key] for key in ("failures", "disabled", "missing", "unexpected", "raw_vuids", "missing_requested_validation_layer", "sanitizer_diagnostics", "over_30_seconds"))
+              result["checks_passed"] = valid and result["validation_layer_loads"] > 0
+              return result
+          report = {"source_commit": os.environ["SOURCE_COMMIT"], "focused": summarize("focused", "focused-inventory.json"), "full": summarize("ctest", "test-inventory.json")}
+          valid = all(report[name]["checks_passed"] for name in ("focused", "full"))
+          valid = valid and "ANYPS5_ENABLE_ASAN:BOOL=ON" in (build / "CMakeCache.txt").read_text()
+          report["checks_passed"] = valid
+          (build / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, indent=2))
+          raise SystemExit(0 if valid else 1)
+          PY
+          python3 tools/check_skips.py build/focused.xml
+          python3 tools/check_skips.py build/ctest.xml
+          test "${{ steps.focused.outcome }}" = success
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Preserve validation evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-runtime-asan-${{ env.SOURCE_COMMIT }}
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: error
+          path: |
+            build/*.log
+            build/*.xml
+            build/*.json
+            build/*.txt
+            build/*.exit
+            build/Testing/Temporary/LastTestsFailed.log
