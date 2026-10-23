@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -644,7 +645,11 @@ class AssemblyTests(unittest.TestCase):
             with self.subTest(wave64=wave64), tempfile.TemporaryDirectory() as tmp:
                 with patch.object(hw_oracle, "target", return_value="gfx1036"):
                     code = hw_oracle.assemble(body, Path(tmp), wave64, **MODES)
-                self.assertTrue(code.is_file())
+                header = code.read_bytes()[:64]
+                self.assertEqual(len(header), 64)
+                self.assertEqual(header[:8], b"\x7fELF\x02\x01\x01\x40")
+                self.assertEqual(struct.unpack_from("<HH", header, 16), (3, 224))
+                self.assertEqual(header[48:52], (Path(tmp) / "k.o").read_bytes()[48:52])
 
 
 class HipRuntimeTests(unittest.TestCase):
