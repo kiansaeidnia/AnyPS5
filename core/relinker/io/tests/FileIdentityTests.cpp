@@ -43,6 +43,20 @@ void run(const std::filesystem::path& directory) {
     require(!Io::SameFile(first, folder), "A file is the same as a directory");
     requireMissing(directory / "missing.bin", first);
     requireMissing(first, directory / "missing.bin");
+    requireMissing(directory / "missing.bin", directory / "missing.bin");
+    requireMissing(directory / "missing.bin", directory / "other-missing.bin");
+#ifndef _WIN32
+    const auto symbolic = directory / "symbolic.bin";
+    const auto dangling = directory / "dangling.bin";
+    std::filesystem::create_symlink(first, symbolic);
+    std::filesystem::create_symlink(directory / "missing.bin", dangling);
+    require(Io::SameFile(first, symbolic), "A symbolic link differs from its target");
+    require(Io::SameFile(symbolic, link), "A symbolic link differs from a hard link to its target");
+    require(!Io::SameFile(symbolic, copy), "A symbolic link is the same as a copy of its target");
+    requireMissing(dangling, first);
+    requireMissing(first, dangling);
+    requireMissing(dangling, dangling);
+#endif
 }
 
 }
