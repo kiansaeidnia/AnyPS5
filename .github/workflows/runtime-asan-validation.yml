@@ -20,7 +20,8 @@ jobs:
       run:
         shell: bash
     env:
-      SOURCE_COMMIT: 9769b07ecebc822b27fce8d28391a347a44945fc
+      SOURCE_COMMIT: fdf198d764bd2b17d78404c34aa1d1e7715fc9cb
+      FOCUSED_TESTS: '^(atomic_shared_ptr.*|guest_http2|agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$'
       ANYPS5_REQUIRE_VULKAN: '1'
       ANYPS5_NO_SHADER_CACHE: '1'
       VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
@@ -94,11 +95,11 @@ jobs:
           python3 tools/check_test_registration.py build
           ctest --test-dir build --show-only=json-v1 > build/test-inventory.json
           ctest --test-dir build --show-only=json-v1 \
-            -R '^(agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$' \
+            -R "$FOCUSED_TESTS" \
             > build/focused-inventory.json
       - name: Build all targets
         id: build
-        run: cmake --build build --parallel 2 2>&1 | tee build/build.log
+        run: cmake --build build --parallel 2 -- -k 0 2>&1 | tee build/build.log
       - name: Build patched runtime libraries
         id: libs
         run: cmake --build build --target libs --parallel 2 2>&1 | tee build/libs.log
@@ -109,7 +110,7 @@ jobs:
         run: |
           set +e
           xvfb-run -a ctest --test-dir build --parallel 1 --timeout 30 --no-tests=error -V \
-            -R '^(agc_(storage_.*|pending_write_snapshot|space_pending_writes|import_settle_storage_image)|agc_driver_pixel_lds(_limit)?|agc_shader_disk_cache|guest_backtrace|request_serializer)$' \
+            -R "$FOCUSED_TESTS" \
             --output-junit "$GITHUB_WORKSPACE/build/focused.xml" \
             --output-log "$GITHUB_WORKSPACE/build/focused.log"
           result=$?
