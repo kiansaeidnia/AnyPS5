@@ -2,7 +2,7 @@ enable_language(C)
 
 set(LIBATRAC9_DIR ${CMAKE_SOURCE_DIR}/3rdparty/LibAtrac9/C/src)
 set(LIBATRAC9_PATCHED_DIR ${CMAKE_CURRENT_BINARY_DIR}/atrac9)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LIBATRAC9_DIR}/unpack.c ${LIBATRAC9_DIR}/bit_reader.c ${LIBATRAC9_DIR}/decinit.c)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LIBATRAC9_DIR}/unpack.c ${LIBATRAC9_DIR}/bit_reader.c ${LIBATRAC9_DIR}/decinit.c ${LIBATRAC9_DIR}/utility.c)
 include(${CMAKE_CURRENT_SOURCE_DIR}/PatchLibAtrac9.cmake)
 add_library(atrac9 STATIC EXCLUDE_FROM_ALL
         ${LIBATRAC9_DIR}/band_extension.c
@@ -17,7 +17,7 @@ add_library(atrac9 STATIC EXCLUDE_FROM_ALL
         ${LIBATRAC9_DIR}/scale_factors.c
         ${LIBATRAC9_DIR}/tables.c
         ${LIBATRAC9_PATCHED_DIR}/unpack.c
-        ${LIBATRAC9_DIR}/utility.c
+        ${LIBATRAC9_PATCHED_DIR}/utility.c
 )
 target_include_directories(atrac9 PRIVATE ${LIBATRAC9_DIR})
 set_target_properties(atrac9 PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -33,6 +33,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/AjmLibrary.cmake)
 add_sce_ajm_library(libSceAjm.native)
 
 if(BUILD_TESTING)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME atrac9_patched_sources COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patched_sources.py
+            ${CMAKE_COMMAND} ${LIBATRAC9_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/PatchLibAtrac9.cmake)
+    endif()
+
     add_test_executable(atrac9_gradient_tests tests/Atrac9Gradient.c ${LIBATRAC9_DIR}/bit_reader.c)
     target_include_directories(atrac9_gradient_tests PRIVATE ${LIBATRAC9_PATCHED_DIR} ${LIBATRAC9_DIR})
     target_link_libraries(atrac9_gradient_tests PRIVATE atrac9)
@@ -51,6 +57,11 @@ if(BUILD_TESTING)
         target_link_libraries(atrac9_config_data_tests PRIVATE m)
     endif()
     add_test(NAME atrac9_config_data COMMAND atrac9_config_data_tests)
+
+    add_test_executable(atrac9_utility_tests tests/Atrac9Utility.c)
+    target_include_directories(atrac9_utility_tests PRIVATE ${LIBATRAC9_DIR})
+    target_link_libraries(atrac9_utility_tests PRIVATE atrac9)
+    add_test(NAME atrac9_utility COMMAND atrac9_utility_tests)
 
     add_test_executable(guest_ajm_tests ${LIBS_INCLUDE_DIR}/tests/GuestAjm.cpp)
     target_include_directories(guest_ajm_tests PRIVATE ${LIBS_INCLUDE_DIR})
