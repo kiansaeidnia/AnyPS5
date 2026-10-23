@@ -97,6 +97,20 @@ if(APPLE AND NOT ANYPS5_RELINKER_ONLY)
 endif()
 
 if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
+    foreach(variant IN ITEMS atomic_shared_ptr atomic_shared_ptr_fallback)
+        add_test_executable(${variant}_tests core/libs/tests/AtomicSharedPtr.cpp)
+        target_include_directories(${variant}_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/libs)
+        target_link_libraries(${variant}_tests PRIVATE Threads::Threads)
+        if(variant STREQUAL "atomic_shared_ptr_fallback")
+            set_target_properties(${variant}_tests PROPERTIES CXX_STANDARD 17)
+        endif()
+        foreach(operation IN ITEMS ownership lifetime concurrent)
+            add_test(NAME ${variant}_${operation} COMMAND ${variant}_tests ${operation})
+            set_tests_properties(${variant}_${operation} PROPERTIES TIMEOUT 10)
+        endforeach()
+    endforeach()
+
     add_test_executable(shader_cache_file_read_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/CacheFileReadTests.cpp)
     target_include_directories(shader_cache_file_read_tests PRIVATE
