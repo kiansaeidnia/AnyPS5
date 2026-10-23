@@ -411,23 +411,18 @@ class TestWebRunnerTests(unittest.TestCase):
                 self.assertEqual(result, 0)
 
     def test_main_reconfigures_streams(self):
-        class Stream:
-            def __init__(self):
-                self.encoding = None
-                self.errors = None
-
-            def reconfigure(self, encoding=None, errors=None):
-                self.encoding = encoding
-                self.errors = errors
-
-        out, err = Stream(), Stream()
-        with patch.object(test_web.sys, "stdout", out), patch.object(test_web.sys, "stderr", err):
-            with self.assertRaises(SystemExit):
-                test_web.main([])
-        self.assertEqual(out.encoding, "utf-8")
-        self.assertEqual(out.errors, "backslashreplace")
-        self.assertEqual(err.encoding, "utf-8")
-        self.assertEqual(err.errors, "backslashreplace")
+        with io.TextIOWrapper(io.BytesIO(), encoding="ascii") as out, \
+                io.TextIOWrapper(io.BytesIO(), encoding="ascii") as err:
+            with patch.object(test_web.sys, "stdout", out), patch.object(test_web.sys, "stderr", err):
+                with self.assertRaises(SystemExit) as error:
+                    test_web.main([])
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(out.encoding, "utf-8")
+            self.assertEqual(out.errors, "backslashreplace")
+            self.assertEqual(err.encoding, "utf-8")
+            self.assertEqual(err.errors, "backslashreplace")
+            err.seek(0)
+            self.assertIn("--build", err.read())
 
 
 if __name__ == "__main__":
