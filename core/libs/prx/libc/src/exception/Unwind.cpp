@@ -10,10 +10,9 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#include <map>
-#include <mutex>
+#include <limits>
+#include <new>
 #include <utility>
-#include <vector>
 #endif
 #if defined(__linux__) && defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
 #define LIBC_UNWIND_FIND_OBJECT 1
@@ -223,16 +222,34 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
 }
 
 #ifdef _WIN32
-using FrameIndex = std::vector<std::pair<Word, const Byte*>>;
+namespace {
+using FrameEntry = std::pair<Word, const Byte*>;
 using ImageKey = std::array<Word, 6>;
 
-const FrameIndex& IndexFrames(const ImageKey& key, const Byte* begin, const Byte* end) {
-    static std::mutex mutex;
-    static std::map<ImageKey, FrameIndex> indexes;
-    std::lock_guard lock(mutex);
-    const auto [entry, inserted] = indexes.try_emplace(key);
-    auto& index = entry->second;
-    if (!inserted) return index;
+struct FrameIndex {
+    ImageKey key;
+    FrameIndex* next;
+    std::size_t count;
+    FrameEntry* entries;
+};
+
+struct FrameCache {
+    SRWLOCK lock = SRWLOCK_INIT;
+    FrameIndex* first{};
+
+    ~FrameCache() {
+        while (first) {
+            auto* entry = first;
+            first = entry->next;
+            VirtualFree(entry, 0, MEM_RELEASE);
+        }
+    }
+};
+
+constinit FrameCache frameCache;
+
+template<class Visitor>
+void VisitFrames(const Byte* begin, const Byte* end, Visitor visit) {
     const Byte* p = begin;
     while (end - p >= 8) {
         const Byte* record = p;
@@ -246,12 +263,53 @@ const FrameIndex& IndexFrames(const ImageKey& key, const Byte* begin, const Byte
             const char* augmentation;
             Byte lsdaEncoding;
             if (DecodeRange(candidate, Lookup {0, record}, cursor, augmentation, lsdaEncoding))
-                index.emplace_back(candidate.start, record);
+                visit(FrameEntry{candidate.start, record});
         }
         p = next;
     }
-    std::sort(index.begin(), index.end());
+}
+
+const FrameIndex* IndexFrames(const ImageKey& key, const Byte* begin, const Byte* end) {
+    AcquireSRWLockExclusive(&frameCache.lock);
+    for (const auto* index = frameCache.first; index; index = index->next) {
+        if (index->key == key) {
+            ReleaseSRWLockExclusive(&frameCache.lock);
+            return index;
+        }
+    }
+    std::size_t count = 0;
+    VisitFrames(begin, end, [&](const FrameEntry&) { ++count; });
+    void* memory = nullptr;
+    if (count <= (std::numeric_limits<std::size_t>::max() - sizeof(FrameIndex)) / sizeof(FrameEntry)) {
+        memory = VirtualAlloc(nullptr, sizeof(FrameIndex) + count * sizeof(FrameEntry),
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
+    if (!memory) {
+        ReleaseSRWLockExclusive(&frameCache.lock);
+        return nullptr;
+    }
+    auto* index = new (memory) FrameIndex{key, frameCache.first, count, nullptr};
+    index->entries = new (index + 1) FrameEntry[count];
+    std::size_t position = 0;
+    VisitFrames(begin, end, [&](const FrameEntry& entry) { index->entries[position++] = entry; });
+    std::sort(index->entries, index->entries + count);
+    frameCache.first = index;
+    ReleaseSRWLockExclusive(&frameCache.lock);
     return index;
+}
+
+const Byte* FindIndexedFrame(const ImageKey& key, const Byte* begin, const Byte* end, Word pc) {
+    if (const auto* index = IndexFrames(key, begin, end)) {
+        const auto* found = std::upper_bound(index->entries, index->entries + index->count, pc,
+            [](Word address, const FrameEntry& entry) { return address < entry.first; });
+        return found == index->entries ? nullptr : std::prev(found)->second;
+    }
+    FrameEntry found{};
+    VisitFrames(begin, end, [&](const FrameEntry& entry) {
+        if (entry.first <= pc && (!found.second || found < entry)) found = entry;
+    });
+    return found.second;
+}
 }
 
 const IMAGE_NT_HEADERS64* ImageHeaders(Word pc, const Byte*& base) {
@@ -376,10 +434,8 @@ bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
         if (std::memcmp(section.Name, ".ehfram", 8) != 0) continue;
         const Byte* frames = base + section.VirtualAddress;
         const ImageKey key {Word(base), nt->FileHeader.TimeDateStamp, nt->OptionalHeader.CheckSum, nt->OptionalHeader.SizeOfImage, section.VirtualAddress, section.Misc.VirtualSize};
-        const auto& index = IndexFrames(key, frames, frames + section.Misc.VirtualSize);
-        auto found = std::upper_bound(index.begin(), index.end(), query.pc, [](Word pc, const std::pair<Word, const Byte*>& entry) { return pc < entry.first; });
-        if (found == index.begin()) continue;
-        query.fde = std::prev(found)->second;
+        query.fde = FindIndexedFrame(key, frames, frames + section.Misc.VirtualSize, query.pc);
+        if (!query.fde) continue;
         frame = {};
         if (DecodeCandidate(context, frame, query)) return true;
     }

@@ -1075,6 +1075,18 @@ endif()
 if(MINGW)
     if(BUILD_TESTING)
         enable_language(ASM)
+        add_test_executable(windows_unwind_allocation_tests
+            ${LIBS_INCLUDE_DIR}/tests/WindowsUnwindAllocation.cpp
+            ${LIBS_INCLUDE_DIR}/tests/WindowsUnwindAllocation.S)
+        target_include_directories(windows_unwind_allocation_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(windows_unwind_allocation_tests PRIVATE libc)
+        configure_windows_unwind(windows_unwind_allocation_tests)
+        foreach(mode IN ITEMS backtrace-heap backtrace-virtual backtrace-both
+                throw-heap throw-virtual throw-both parallel-heap parallel-both)
+            add_test(NAME windows_unwind_allocation_${mode} COMMAND windows_unwind_allocation_tests ${mode})
+            set_tests_properties(windows_unwind_allocation_${mode} PROPERTIES TIMEOUT 20
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
         add_test_executable(guest_message_destructor_abi_tests
             ${LIBS_INCLUDE_DIR}/tests/GuestMessageDestructorAbi.cpp
             ${LIBS_INCLUDE_DIR}/tests/GuestMessageDestructorAbi.S)
