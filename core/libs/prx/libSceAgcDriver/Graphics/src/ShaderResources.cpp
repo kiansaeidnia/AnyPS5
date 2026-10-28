@@ -1652,7 +1652,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             return texture;
         }
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
-        std::vector<std::byte> snapshot(bytes);
+        const auto snapshotBytes = RuntimeSwitches::Set(RuntimeSwitch::NoSnapshotOverwrite) ? std::make_unique<std::byte[]>(bytes) : std::make_unique_for_overwrite<std::byte[]>(bytes);
+        const std::span<std::byte> snapshot(snapshotBytes.get(), bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
@@ -1891,7 +1892,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             entry.blockGuard = untrackedGuard(address, bytes);
             entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes, entry.blockLayout) : 0;
         }
-        std::vector<std::byte> snapshot(bytes);
+        const auto snapshotBytes = RuntimeSwitches::Set(RuntimeSwitch::NoSnapshotOverwrite) ? std::make_unique<std::byte[]>(bytes) : std::make_unique_for_overwrite<std::byte[]>(bytes);
+        const std::span<std::byte> snapshot(snapshotBytes.get(), bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
