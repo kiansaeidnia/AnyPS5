@@ -107,6 +107,7 @@ enum class RuntimeSwitch : std::size_t {
     NoDeferOverLeases,
     NoLeaseGuard,
     NoSnapshotScratch,
+    NoDirectSnapshotStaging,
     Count,
 };
 
