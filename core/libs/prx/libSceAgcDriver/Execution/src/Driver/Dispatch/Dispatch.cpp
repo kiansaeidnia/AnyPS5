@@ -127,7 +127,7 @@ void ReportWaits() {
         std::snprintf(item, sizeof(item), " %s %llu/%.1f", DrainSiteNames[i], static_cast<unsigned long long>(count), ns / 1e6);
         sites += item;
     }
-    std::fprintf(stderr, "[dispatch-item] (10 s) %llu commit items (%llu rebuilt), %llu miss items (%llu refused); fallbacks:%s\n[dispatch-drain] busy draw-pipeline drains by site (count/ms, 10 s):%s\n%s\n%s\n", static_cast<unsigned long long>(itemCommits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.exchange(0, std::memory_order_relaxed)), drained.c_str(), sites.c_str(), Graphics::StorageTexture::WaitReport().c_str(), Graphics::Recorder::KeptWaitReport().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-item] (10 s) %llu commit items (%llu rebuilt), %llu miss items (%llu refused); fallbacks:%s\n[dispatch-drain] busy draw-pipeline drains by site (count/ms, 10 s):%s\n%s\n%s\n", static_cast<unsigned long long>(itemCommits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.exchange(0, std::memory_order_relaxed)), drained.c_str(), sites.c_str(), Graphics::StorageTexture::WaitReport().c_str(), Graphics::Recorder::KeptWaitReport().c_str());
 }
 
 void ReportDispatchItems(bool profile) {

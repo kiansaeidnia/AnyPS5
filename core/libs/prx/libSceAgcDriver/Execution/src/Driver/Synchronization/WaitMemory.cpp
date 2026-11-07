@@ -15,6 +15,10 @@
 #endif
 #include <immintrin.h>
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <map>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -33,6 +37,59 @@ void PollSleep() {
     }
 #endif
     std::this_thread::sleep_for(std::chrono::microseconds(200));
+}
+
+namespace {
+
+bool PolledWaitsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_WAITS") != nullptr;
+    return profiled;
+}
+
+struct PolledWaits {
+    std::mutex mutex;
+    std::map<std::string, std::pair<std::uint64_t, double>> byKey;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+PolledWaits& PolledWaitCounts() {
+    static PolledWaits waits;
+    return waits;
+}
+
+const char* RefusalName(Graphics::Recorder::LabelRefusal refusal) {
+    switch (refusal) {
+        case Graphics::Recorder::LabelRefusal::None: return "no table entry";
+        case Graphics::Recorder::LabelRefusal::TrustOff: return "trust off";
+        case Graphics::Recorder::LabelRefusal::Queued: return "queued";
+        case Graphics::Recorder::LabelRefusal::Overwritten: return "overwritten";
+        case Graphics::Recorder::LabelRefusal::Unclosed: return "unclosed";
+        case Graphics::Recorder::LabelRefusal::BehindCompletion: return "behind completion";
+    }
+    return "?";
+}
+
+void NotePolledWait(const std::string& key, double ms) {
+    auto& waits = PolledWaitCounts();
+    std::lock_guard lock(waits.mutex);
+    auto& entry = waits.byKey[key];
+    ++entry.first;
+    entry.second += ms;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - waits.reported < std::chrono::seconds(10)) return;
+    waits.reported = now;
+    std::vector<std::pair<std::string, std::pair<std::uint64_t, double>>> order(waits.byKey.begin(), waits.byKey.end());
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    std::string report = "[polled-wait] WAIT_REG_MEM waits that polled (10 s; waiter <- newest writer packet, table answer at the last lookup, how it ended: count/ms):";
+    for (std::size_t index = 0; index < order.size() && index < 14; ++index) {
+        char item[256];
+        std::snprintf(item, sizeof(item), " | %s %llu/%.1f", order[index].first.c_str(), static_cast<unsigned long long>(order[index].second.first), order[index].second.second);
+        report += item;
+    }
+    waits.byKey.clear();
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", report.c_str());
+}
+
 }
 
 int Driver::waitTimeoutMs() {
@@ -156,6 +213,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint64_t refusedGeneration = 0;
 
     bool behindCompletion = false;
+    auto lastRefusal = Graphics::Recorder::LabelRefusal::None;
+    bool tableLooked = false;
     const auto traceLate = [&](const char* outcome, const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal) {
         static std::atomic<int> shown{0};
         if (shown.fetch_add(1) >= 200) return;
@@ -164,6 +223,9 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     const auto takeLabel = [&](const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal, bool polling, bool unlockedHit) {
         behindCompletion = refusal == Graphics::Recorder::LabelRefusal::BehindCompletion;
+        lastRefusal = hit.has_value() && refusal == Graphics::Recorder::LabelRefusal::None ? Graphics::Recorder::LabelRefusal::None : refusal;
+        tableLooked = true;
+        if (hit.has_value() && !Pm4::WaitComparesValue(packet, hit->value)) lastRefusal = Graphics::Recorder::LabelRefusal::Queued;
         const bool trace = traceLateLabels() && (refusal != Graphics::Recorder::LabelRefusal::None || (hit.has_value() && hit->late));
         if (!hit.has_value() || !Pm4::WaitComparesValue(packet, hit->value)) {
             if (trace) traceLate(hit.has_value() ? "value mismatch" : "refused by the table", hit, refusal);
@@ -325,6 +387,31 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    const char* endedBy = "memory";
+    const auto polledStart = std::chrono::steady_clock::now();
+    const std::function<void()> notePolled = [&] {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - polledStart).count();
+        const auto& history = writeHistory();
+        const auto cursor = writeCursor();
+        const WriteRecord* newest = nullptr;
+        for (std::size_t back = 1; back <= history.size() && back <= cursor; ++back) {
+            const auto& record = history[(cursor - back) % history.size()];
+            if (record.length != 0 && record.target <= awaited && awaited < record.target + std::max<std::uint64_t>(record.length, 4)) {
+                newest = &record;
+                break;
+            }
+        }
+        char key[200];
+        if (newest != nullptr) std::snprintf(key, sizeof(key), "q%x <- q%x op %x, %s, %s", queue, newest->queue, newest->opcode, tableLooked ? RefusalName(lastRefusal) : "table not looked up", endedBy);
+        else std::snprintf(key, sizeof(key), "q%x <- no writer packet, %s, %s", queue, tableLooked ? RefusalName(lastRefusal) : "table not looked up", endedBy);
+        NotePolledWait(key, ms);
+    };
+    struct PolledWait {
+        const std::function<void()>* note;
+        ~PolledWait() {
+            if (note != nullptr) (*note)();
+        }
+    } polledWait{PolledWaitsProfiled() ? &notePolled : nullptr};
     noteWaitFields(queue, packet);
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
@@ -343,6 +430,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
+            endedBy = "stored since";
             return;
         }
         ++polls;
@@ -356,13 +444,19 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::this_thread::yield();
         }
         CheckFailure();
-        if (pollService(!spinning)) return;
+        if (pollService(!spinning)) {
+            endedBy = "table while polling";
+            return;
+        }
         if (storeHeldResults && !spinning && (polls & 31u) == 0) GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    endedBy = "settled";
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
