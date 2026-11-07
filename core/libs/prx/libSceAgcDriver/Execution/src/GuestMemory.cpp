@@ -3279,6 +3279,30 @@ void ReadCommittedHashed(std::uint64_t address, std::span<std::byte> destination
     for (std::size_t index = 0; index < out.size(); ++index) readBlock(&job, index);
 }
 
+void HashCommittedRead(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out) {
+    requireNotSpeculative("read of committed pages");
+    require(out.size() == HashBlockCount(address, bytes), "hash block count differs");
+    if (bytes == 0) return;
+    GuardRead(address, bytes);
+    FlushGpuWrites(address, bytes);
+    const TimedAccess timed(CounterRead, bytes);
+    CountReadCaller(__builtin_return_address(0));
+    CommittedHasher hash(address, bytes);
+    struct Job {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::span<ContentHash::Hash128> out;
+        CommittedHasher* hash;
+    } job{address, bytes, out, &hash};
+    const auto hashBlock = [](void* context, std::size_t index) {
+        const auto& state = *static_cast<const Job*>(context);
+        const auto [begin, length] = hashBlockAt(state.address, state.bytes, index);
+        state.out[index] = (*state.hash)(begin, length);
+    };
+    if (parallelHash(bytes) && Graphics::RunOnCompareHelpers(out.size(), hashBlock, &job)) return;
+    for (std::size_t index = 0; index < out.size(); ++index) hashBlock(&job, index);
+}
+
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;

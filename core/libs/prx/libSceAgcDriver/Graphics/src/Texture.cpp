@@ -618,7 +618,11 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
     : Texture(context, detiler, descriptor, components, snapshot.size(), [snapshot](std::span<std::byte> staging) { std::memcpy(staging.data(), snapshot.data(), snapshot.size()); }, depthCompare, hostMemory) {
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::size_t snapshotBytes, const std::function<void(std::span<std::byte>)>& fill, bool depthCompare, bool hostMemory, bool cachedStaging) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::size_t snapshotBytes, const HostImport& import, bool depthCompare, bool hostMemory)
+    : Texture(context, detiler, descriptor, components, snapshotBytes, {}, depthCompare, hostMemory, false, &import) {
+}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::size_t snapshotBytes, const std::function<void(std::span<std::byte>)>& fill, bool depthCompare, bool hostMemory, bool cachedStaging, const HostImport* import) : context(context) {
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::SampledTexture);
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -755,8 +759,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
             const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
-            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, cachedStaging));
-            fill(staging->Bytes().first(static_cast<std::size_t>(guestBytes)));
+            std::shared_ptr<Buffer> staging;
+            if (import == nullptr) {
+                staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, cachedStaging));
+                fill(staging->Bytes().first(static_cast<std::size_t>(guestBytes)));
+            } else {
+                // Units another image's results shadow reach the import before the copy reads it in place.
+                PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
+            }
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();
@@ -774,8 +784,11 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
+                // A queued label store in the surface lands before the copy reads the import.
+                if (import != nullptr) recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
                 commands = recorder->Commands();
-                recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
+                if (staging != nullptr) recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
+                else recorder->NotePendingRead(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), Recorder::ReadKind::CopySource);
                 recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
@@ -786,7 +799,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
 
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            if (staging != nullptr) CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            else CopyBuffer(context, commands, import->buffer, HostImportOffset(*import, descriptor.baseAddress), tiled->Handle(), 0, guestBytes);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {

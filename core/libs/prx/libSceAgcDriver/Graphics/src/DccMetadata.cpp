@@ -787,6 +787,11 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
     if (keys == DccKeys::ClearSingle) ExpandSingleBlocks(bytes, BytesPerElement(resource.format));
 }
 
+void HashUncompressedSurface(const GuestTextureResource& resource, std::size_t bytes, std::span<ContentHash::Hash128> hashes) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+    GuestMemory::HashCommittedRead(resource.baseAddress, bytes, hashes);
+}
+
 void ReadUncompressedSurfaceHashed(const GuestTextureResource& resource, std::span<std::byte> bytes, std::span<ContentHash::Hash128> hashes) {
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
     GuestMemory::ReadCommittedHashed(resource.baseAddress, bytes, hashes);

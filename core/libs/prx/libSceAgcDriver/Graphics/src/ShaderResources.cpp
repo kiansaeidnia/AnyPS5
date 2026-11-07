@@ -2055,7 +2055,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             }
         };
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
-        if (RuntimeSwitches::Set(RuntimeSwitch::NoDirectSnapshotStaging)) {
+        // An uncompressed surface in guest memory with a host import is hashed in place and copied by the
+        // batch from the import, so the CPU does not copy it (APS5_NO_SNAPSHOT_IMPORT_COPY, a runtime switch,
+        // reads it into a staging buffer as below).
+        const HostImport* import = *keys == DccKeys::Uncompressed && !traceTextures && !RuntimeSwitches::Set(RuntimeSwitch::NoSnapshotImportCopy) ? HostImportFor(context, address, static_cast<std::size_t>(bytes)) : nullptr;
+        if (import != nullptr) {
+            entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
+            HashUncompressedSurface(resource, static_cast<std::size_t>(bytes), entry.hashes);
+            entry.texture = createTexture(*context.detiler, resource, components, static_cast<std::size_t>(bytes), *import, depthCompare, spill);
+        } else if (RuntimeSwitches::Set(RuntimeSwitch::NoDirectSnapshotStaging)) {
             const SnapshotBuffer snapshotBuffer(bytes);
             readSnapshot(snapshotBuffer.Bytes());
             entry.texture = createTexture(*context.detiler, resource, components, std::span<const std::byte>(snapshotBuffer.Bytes()), depthCompare, spill);
