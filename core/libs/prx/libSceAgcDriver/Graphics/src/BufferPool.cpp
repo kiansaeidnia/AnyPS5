@@ -478,7 +478,7 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
 }
 
 std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_WAITS") != nullptr;
     const auto capacity = Capacity(bytes, properties);
     std::lock_guard lock(mutex);
     ++clock;
