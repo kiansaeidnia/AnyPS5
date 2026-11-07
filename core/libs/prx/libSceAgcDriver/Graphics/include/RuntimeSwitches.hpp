@@ -109,6 +109,7 @@ enum class RuntimeSwitch : std::size_t {
     NoSnapshotScratch,
     NoDirectSnapshotStaging,
     NoFusedSnapshotHash,
+    NoParallelBlockHash,
     Count,
 };
 
