@@ -312,6 +312,9 @@ public:
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
     void OrderAfterLane(int from);
+    // As OrderAfterLane, but only for the work recorded from now on: the calling lane's open batch, when it holds
+    // commands, is submitted without the wait, and the batch opened for the next command waits for lane `from`.
+    void SplitAfterLane(int from);
     // APS5_PROFILE_DRAW: the [lane-order] line (CompletedThrough answers lowered by the opening
     // serials, cached-template data edges between the lanes).
     static std::string LaneOrderReport();
