@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <deque>
+#include <span>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -147,7 +149,9 @@ std::atomic<std::uint64_t> deferredRefreshFlushes{0};
 // - a copied writer, a completion label or a completion store overlaps a stored range: its CPU store at its batch's
 //   reap could land before or after the recorded write-back (APS5_DEFER_OVER_COMPLETIONS);
 // - a writer of the async lane overlaps a stored range while the flushing thread records on lane 0: the write-back
-//   in lane 0 is not ordered after it (APS5_DEFER_OVER_LANE).
+//   in lane 0 is not ordered after it (APS5_DEFER_OVER_LANE). Unless APS5_NO_DEFER_LANE_EDGE is set, such a flush
+//   orders it instead: lane 0's open batch is submitted as it is and the batch the write-back goes to waits on the
+//   GPU for everything the async lane recorded so far (Recorder::SplitAfterLane).
 // An address-based lease over a stored range is not waited for: in measured runs almost no such wait stamped the
 // stored blocks, and waiting cost the whole gain. Its BDA stores are stamped only when its batch completes, so a lease
 // that does write the stored range would have them stored over. The lease guard samples: every
@@ -164,10 +168,66 @@ constexpr std::array<const char*, 7> GpuOrderedReasons{"readback before label", 
 std::array<std::atomic<std::uint64_t>, GpuOrderedReasons.size()> gpuOrderedFlushes{};
 enum class GpuOrderRefusal : std::size_t { Unwatched, Completion, Lane, Count };
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GpuOrderRefusal::Count)> gpuOrderRefusals{};
-std::atomic<std::uint64_t> gpuOrderLeaseWaits{0}, gpuOrderLeaseStamped{0}, gpuOrderKeptForWriter{0};
+std::atomic<std::uint64_t> gpuOrderLeaseWaits{0}, gpuOrderLeaseStamped{0}, gpuOrderKeptForWriter{0}, gpuOrderLaneEdges{0};
 // Flushes over a pending lease that skipped its wait, those the guard sampled, and whether a sampled wait stamped.
 std::atomic<std::uint64_t> gpuOrderLeaseSkipped{0}, gpuOrderLeaseSampled{0}, gpuOrderLeaseCovered{0};
 std::atomic<bool> leaseGuardTripped{false};
+
+enum class LeaseStoreCheck { Off, Report, Trip };
+
+LeaseStoreCheck LeaseStoreCheckMode() {
+    static const LeaseStoreCheck mode = [] {
+        const char* text = std::getenv("APS5_LEASE_STORE_CHECK");
+        if (text == nullptr || *text == '\0') return LeaseStoreCheck::Trip;
+        if (std::strcmp(text, "report") == 0) return LeaseStoreCheck::Report;
+        if (std::strcmp(text, "0") == 0) return LeaseStoreCheck::Off;
+        return LeaseStoreCheck::Trip;
+    }();
+    return mode;
+}
+
+struct LeaseSkip {
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::uint64_t through;
+};
+
+struct LeaseSkips {
+    AgcDriver::Mutex mutex;
+    std::deque<LeaseSkip> entries;
+    std::atomic<std::size_t> live{0};
+};
+
+LeaseSkips& SkippedLeases() {
+    static LeaseSkips skips;
+    return skips;
+}
+
+constexpr std::size_t MaxLeaseSkips = 65536;
+std::atomic<std::uint64_t> leaseSkipsNoted{0}, leaseSkipsDropped{0}, leaseStoreChecks{0}, leaseStoreHits{0};
+
+void NoteLeaseSkip(const Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (LeaseStoreCheckMode() == LeaseStoreCheck::Off) return;
+    std::vector<LeaseSkip> noted;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto through = recorder.PendingLeaseSerial(begin, static_cast<std::size_t>(end - begin));
+        if (through != 0) noted.push_back({begin, end, through});
+    }
+    const auto retired = recorder.RetiredSerial();
+    auto& skips = SkippedLeases();
+    std::lock_guard lock(skips.mutex);
+    while (!skips.entries.empty() && skips.entries.front().through + 2 < retired) skips.entries.pop_front();
+    for (const auto& entry : noted) {
+        if (skips.entries.size() >= MaxLeaseSkips) {
+            skips.entries.pop_front();
+            leaseSkipsDropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        skips.entries.push_back(entry);
+    }
+    leaseSkipsNoted.fetch_add(noted.size(), std::memory_order_relaxed);
+    skips.live.store(skips.entries.size(), std::memory_order_release);
+}
 
 std::uint64_t LeaseSampleInterval() {
     static const std::uint64_t interval = [] {
@@ -377,8 +437,8 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         lastOrdered[index] = total;
     }
     const auto order = StorageTexture::GpuOrderTotals();
-    char kept[256];
-    std::snprintf(kept, sizeof(kept), "; kept waiting: unwatched %llu, completions %llu, lane %llu; lease waits %llu (%llu stamped the stored blocks); blocks left to a pending writer %llu; leases skipped %llu, sampled %llu%s", static_cast<unsigned long long>(order.unwatched - lastOrder.unwatched), static_cast<unsigned long long>(order.completions - lastOrder.completions), static_cast<unsigned long long>(order.lane - lastOrder.lane), static_cast<unsigned long long>(order.leaseWaits - lastOrder.leaseWaits), static_cast<unsigned long long>(order.leaseStamped - lastOrder.leaseStamped), static_cast<unsigned long long>(order.keptForWriter - lastOrder.keptForWriter), static_cast<unsigned long long>(order.leaseSkipped - lastOrder.leaseSkipped), static_cast<unsigned long long>(order.leaseSampled - lastOrder.leaseSampled), order.leaseGuardTripped ? ", lease guard tripped" : "");
+    char kept[384];
+    std::snprintf(kept, sizeof(kept), "; kept waiting: unwatched %llu, completions %llu, lane %llu (lane edges instead %llu); lease waits %llu (%llu stamped the stored blocks); blocks left to a pending writer %llu; leases skipped %llu, sampled %llu%s", static_cast<unsigned long long>(order.unwatched - lastOrder.unwatched), static_cast<unsigned long long>(order.completions - lastOrder.completions), static_cast<unsigned long long>(order.lane - lastOrder.lane), static_cast<unsigned long long>(order.laneEdges - lastOrder.laneEdges), static_cast<unsigned long long>(order.leaseWaits - lastOrder.leaseWaits), static_cast<unsigned long long>(order.leaseStamped - lastOrder.leaseStamped), static_cast<unsigned long long>(order.keptForWriter - lastOrder.keptForWriter), static_cast<unsigned long long>(order.leaseSkipped - lastOrder.leaseSkipped), static_cast<unsigned long long>(order.leaseSampled - lastOrder.leaseSampled), order.leaseGuardTripped ? ", lease guard tripped" : "");
     ordered += kept;
     lastOrder = order;
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
@@ -4997,7 +5057,9 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         if (deferWriter && ordered >= 0) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
             for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, ranges);
-            const auto refusal = GpuOrderRefused(*Recorder::Active(), flush.front()->context, ranges, asyncLaneThread);
+            auto refusal = GpuOrderRefused(*Recorder::Active(), flush.front()->context, ranges, asyncLaneThread);
+            const bool laneEdge = refusal == GpuOrderRefusal::Lane && !RuntimeSwitches::Set(RuntimeSwitch::NoDeferLaneEdge);
+            if (laneEdge) refusal.reset();
             if (refusal) {
                 deferWriter = false;
                 gpuOrderRefusals[static_cast<std::size_t>(*refusal)].fetch_add(1, std::memory_order_relaxed);
@@ -5017,9 +5079,14 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                         leaseSample = interval != 0 && gpuOrderLeaseCovered.fetch_add(1, std::memory_order_relaxed) % interval == 0;
                         leaseWait = leaseSample;
                         if (leaseSample) waitCause = "lease guard sample";
+                        else NoteLeaseSkip(active, ranges);
                         (leaseSample ? gpuOrderLeaseSampled : gpuOrderLeaseSkipped).fetch_add(1, std::memory_order_relaxed);
                     }
                 }
+            }
+            if (laneEdge) {
+                Recorder::Active()->SplitAfterLane(1);
+                gpuOrderLaneEdges.fetch_add(1, std::memory_order_relaxed);
             }
             static constexpr const char* refusals[] = {"outside the write watch", "over a copied writer or completion store", "over an async-lane writer"};
             if (trace) std::fprintf(stderr, "[flush] %s 0x%llx+0x%zx: %s%s\n", reason, static_cast<unsigned long long>(address), bytes, refusal ? "waits for the writer, " : "GPU-ordered", refusal ? refusals[static_cast<std::size_t>(*refusal)] : leaseSample ? " (lease guard sample: waits for the address-based lease)" : leaseWait ? " (address-based leases still waited for)" : "");
@@ -5423,7 +5490,31 @@ StorageTexture::GpuOrderCounts StorageTexture::GpuOrderTotals() {
     counts.leaseSkipped = gpuOrderLeaseSkipped.load(std::memory_order_relaxed);
     counts.leaseSampled = gpuOrderLeaseSampled.load(std::memory_order_relaxed);
     counts.leaseGuardTripped = leaseGuardTripped.load(std::memory_order_relaxed);
+    counts.laneEdges = gpuOrderLaneEdges.load(std::memory_order_relaxed);
     return counts;
+}
+
+void StorageTexture::NoteBdaStores(std::uint64_t address, std::size_t bytes) {
+    auto& skips = SkippedLeases();
+    if (bytes == 0 || skips.live.load(std::memory_order_acquire) == 0) return;
+    const auto serial = Recorder::CompletingSerial();
+    leaseStoreChecks.fetch_add(1, std::memory_order_relaxed);
+    const auto end = address + bytes;
+    std::optional<LeaseSkip> hit;
+    {
+        std::lock_guard lock(skips.mutex);
+        for (const auto& entry : skips.entries) {
+            if (serial != 0 && entry.through < serial) continue;
+            if (address < entry.end && entry.begin < end) {
+                hit = entry;
+                break;
+            }
+        }
+    }
+    if (!hit) return;
+    const auto hits = leaseStoreHits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (hits <= 8) std::fprintf(stderr, "[lease-check] BDA stores of batch %llu at 0x%llx+0x%zx overlap 0x%llx-0x%llx, which a GPU-ordered write-back stored without waiting for the address-based lease pending through batch %llu%s\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(hit->begin), static_cast<unsigned long long>(hit->end), static_cast<unsigned long long>(hit->through), LeaseStoreCheckMode() == LeaseStoreCheck::Report ? " (report only)" : "");
+    if (LeaseStoreCheckMode() == LeaseStoreCheck::Trip && !leaseGuardTripped.exchange(true, std::memory_order_relaxed)) std::fprintf(stderr, "[defer] lease guard: BDA stores overlapped a range stored without waiting for their lease; GPU-ordered write-backs wait for address-based leases for the rest of the run\n");
 }
 
 std::string StorageTexture::WaitReport() {
@@ -5442,8 +5533,15 @@ std::string StorageTexture::WaitReport() {
     const auto order = GpuOrderTotals();
     const auto refresh = deferredRefreshFlushes.load(std::memory_order_relaxed);
     const auto labels = deferredLabelReadbacksTotal.load(std::memory_order_relaxed);
-    std::snprintf(text, sizeof(text), "; refresh-alone %llu, label read-backs %llu; refused: unwatched %llu, completions %llu, lane %llu; lease waits %llu (%llu stamped), leases skipped %llu, sampled %llu%s", static_cast<unsigned long long>(refresh - lastRefresh), static_cast<unsigned long long>(labels - lastLabels), static_cast<unsigned long long>(order.unwatched - lastOrder.unwatched), static_cast<unsigned long long>(order.completions - lastOrder.completions), static_cast<unsigned long long>(order.lane - lastOrder.lane), static_cast<unsigned long long>(order.leaseWaits - lastOrder.leaseWaits), static_cast<unsigned long long>(order.leaseStamped - lastOrder.leaseStamped), static_cast<unsigned long long>(order.leaseSkipped - lastOrder.leaseSkipped), static_cast<unsigned long long>(order.leaseSampled - lastOrder.leaseSampled), order.leaseGuardTripped ? ", lease guard tripped" : "");
+    std::snprintf(text, sizeof(text), "; refresh-alone %llu, label read-backs %llu; refused: unwatched %llu, completions %llu, lane %llu, lane edges %llu; lease waits %llu (%llu stamped), leases skipped %llu, sampled %llu%s", static_cast<unsigned long long>(refresh - lastRefresh), static_cast<unsigned long long>(labels - lastLabels), static_cast<unsigned long long>(order.unwatched - lastOrder.unwatched), static_cast<unsigned long long>(order.completions - lastOrder.completions), static_cast<unsigned long long>(order.lane - lastOrder.lane), static_cast<unsigned long long>(order.laneEdges - lastOrder.laneEdges), static_cast<unsigned long long>(order.leaseWaits - lastOrder.leaseWaits), static_cast<unsigned long long>(order.leaseStamped - lastOrder.leaseStamped), static_cast<unsigned long long>(order.leaseSkipped - lastOrder.leaseSkipped), static_cast<unsigned long long>(order.leaseSampled - lastOrder.leaseSampled), order.leaseGuardTripped ? ", lease guard tripped" : "");
     report += text;
+    static std::uint64_t lastNoted = 0, lastChecks = 0, lastHits = 0;
+    const auto noted = leaseSkipsNoted.load(std::memory_order_relaxed), checks = leaseStoreChecks.load(std::memory_order_relaxed), hits = leaseStoreHits.load(std::memory_order_relaxed);
+    std::snprintf(text, sizeof(text), "\n[lease-check] (10 s) skipped leases noted %llu (live %zu, dropped %llu total), BDA store ranges checked %llu, overlaps %llu (total %llu)", static_cast<unsigned long long>(noted - lastNoted), SkippedLeases().live.load(std::memory_order_relaxed), static_cast<unsigned long long>(leaseSkipsDropped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(checks - lastChecks), static_cast<unsigned long long>(hits - lastHits), static_cast<unsigned long long>(hits));
+    report += text;
+    lastNoted = noted;
+    lastChecks = checks;
+    lastHits = hits;
     lastOrder = order;
     lastRefresh = refresh;
     lastLabels = labels;

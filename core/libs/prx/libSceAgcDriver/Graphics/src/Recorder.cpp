@@ -299,6 +299,7 @@ bool RecorderAlive(std::uint64_t id) {
 // Completion actions in progress on this thread (finish()): a pending-write sync the flush hook
 // makes from inside one (a copied buffer's write-back store) is skipped, see SyncThrough.
 thread_local int completionDepth = 0;
+thread_local std::uint64_t completingSerial = 0;
 // This thread's hook syncs that waited for an unsignaled target (Recorder::ThreadHookWaits).
 thread_local std::uint64_t hookRealWaits = 0;
 
@@ -306,6 +307,10 @@ thread_local std::uint64_t hookRealWaits = 0;
 
 bool Recorder::InCompletion() {
     return completionDepth != 0;
+}
+
+std::uint64_t Recorder::CompletingSerial() {
+    return completingSerial;
 }
 
 namespace {
@@ -1521,6 +1526,14 @@ void Recorder::OrderAfterLane(int from) {
     const int to = currentLane();
     if (!AsyncLaneActive() || from == to) return;
     switchEdge(from, to, true);
+}
+
+void Recorder::SplitAfterLane(int from) {
+    GuestMemory::AssertGpuLockHeld("Recorder::SplitAfterLane");
+    const int to = currentLane();
+    if (!AsyncLaneActive() || from == to) return;
+    switchEdge(from, to, false);
+    static_cast<void>(Commands());
 }
 
 void Recorder::CountTemplateEdge(bool beforeRefresh) {
@@ -5879,9 +5892,16 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
         struct InCompletion {
-            InCompletion() { ++completionDepth; }
-            ~InCompletion() { --completionDepth; }
-        } inCompletion;
+            std::uint64_t previous;
+            explicit InCompletion(std::uint64_t serial) : previous(completingSerial) {
+                ++completionDepth;
+                completingSerial = serial;
+            }
+            ~InCompletion() {
+                --completionDepth;
+                completingSerial = previous;
+            }
+        } inCompletion{batch->serial};
         for (auto& action : batch->completions) {
             try {
                 action();

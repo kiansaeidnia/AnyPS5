@@ -637,7 +637,7 @@ struct DropReleasedDependents {
 };
 
 void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_WAITS") != nullptr;
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - cache.countsReported < std::chrono::seconds(10)) return;

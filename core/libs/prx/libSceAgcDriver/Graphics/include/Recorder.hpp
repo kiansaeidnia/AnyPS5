@@ -312,6 +312,9 @@ public:
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
     void OrderAfterLane(int from);
+    // As OrderAfterLane, but only for the work recorded from now on: the calling lane's open batch, when it holds
+    // commands, is submitted without the wait, and the batch opened for the next command waits for lane `from`.
+    void SplitAfterLane(int from);
     // APS5_PROFILE_DRAW: the [lane-order] line (CompletedThrough answers lowered by the opening
     // serials, cached-template data edges between the lanes).
     static std::string LaneOrderReport();
@@ -767,6 +770,7 @@ public:
     // Whether the calling thread runs inside a batch's completion action (finish()): a store made
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();
+    static std::uint64_t CompletingSerial();
     void Activate();
     // APS5_PROFILE_DRAW: syncs by source (0 device idle, 1 CPU access to pending writes, 2 CPU read
     // after a recorded store, 3 address-based dispatch, 4 other). Contract: the call announces the

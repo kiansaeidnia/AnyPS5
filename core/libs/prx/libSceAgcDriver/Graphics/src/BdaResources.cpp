@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ImageTableAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
@@ -531,6 +532,7 @@ void BdaResources::markWrittenPages() const {
             }
         }
         GuestMemory::MarkPossiblyWritten(begin, bytes);
+        StorageTexture::NoteBdaStores(begin, bytes);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];
