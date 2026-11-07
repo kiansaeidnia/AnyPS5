@@ -926,6 +926,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
+        Graphics/src/ParallelCompare.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -938,6 +939,7 @@ add_executable(agc_miss_bench EXCLUDE_FROM_ALL
         tools/MissBench.cpp
         Execution/src/ShaderMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
+        Graphics/src/ParallelCompare.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -1029,6 +1031,7 @@ configure_windows_unwind(agc_locks_tests)
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Graphics/src/ParallelCompare.cpp
         Graphics/src/RuntimeSwitches.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -1069,6 +1072,7 @@ if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
+            Graphics/src/ParallelCompare.cpp
             Graphics/src/RuntimeSwitches.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
@@ -1882,6 +1886,12 @@ if(BUILD_TESTING)
         ENVIRONMENT "APS5_PROFILE_GPU=1" TIMEOUT 15 SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_recorder_device_selection agc_gpu_timing_complete agc_gpu_timing_incomplete PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_label_clobber_trace COMMAND agc_driver_recorder_tests --label-clobber-only)
+    set_tests_properties(agc_label_clobber_trace PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_label_clobber_trace PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_command_memory_reuse COMMAND agc_driver_recorder_tests --command-reuse-only)
@@ -3200,6 +3210,14 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_storage_flush_lane_wait_off agc_driver_storage_flush_lane_wait_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # GPU-ordered storage write-backs off (APS5_NO_DEFER_STORES): the flushes wait for their writer as before.
+    foreach(agcNoDeferTest IN ITEMS storage_flush_ordering storage_flush_lane_wait linear_readback_label depth_plane_sampling depth_plane_buffer_memory host_write_pending_storage copied_writer_label_order storage_read_during_idle_store)
+        add_test(NAME agc_driver_${agcNoDeferTest}_no_defer COMMAND agc_driver_${agcNoDeferTest}_tests)
+        set_tests_properties(agc_driver_${agcNoDeferTest}_no_defer PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DEFER_STORES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+        if(WIN32)
+            set_tests_properties(agc_driver_${agcNoDeferTest}_no_defer PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_driver_copied_writer_label_order_drain COMMAND agc_driver_copied_writer_label_order_tests)
     set_tests_properties(agc_driver_copied_writer_label_order_drain PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAIN_COMPLETION_LABELS=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     if(WIN32)
