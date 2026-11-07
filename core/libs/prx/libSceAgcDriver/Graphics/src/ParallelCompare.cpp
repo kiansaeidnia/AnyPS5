@@ -1,13 +1,16 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <immintrin.h>
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -38,6 +41,7 @@ public:
             next.store(0, std::memory_order_relaxed);
             done.store(0, std::memory_order_relaxed);
             ++generation;
+            published.store(generation, std::memory_order_release);
         }
         wake.notify_all();
         drain(count, job, context);
@@ -56,6 +60,7 @@ public:
             std::lock_guard caller(callers);
             std::lock_guard lock(mutex);
             stopping = true;
+            stopRequested.store(true, std::memory_order_release);
             joined.swap(workers);
         }
         wake.notify_all();
@@ -86,6 +91,11 @@ private:
         std::uint64_t seen = 0;
         std::unique_lock lock(mutex);
         for (;;) {
+            if (generation == seen && !stopping) {
+                lock.unlock();
+                spinForJob(seen);
+                lock.lock();
+            }
             wake.wait(lock, [&] { return generation != seen || stopping; });
             if (stopping) break;
             seen = generation;
@@ -106,7 +116,28 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable finished;
+    // Jobs come in bursts (the sampled snapshots of one draw), and a helper that has gone to sleep wakes too
+    // late to take much of a small job: after a job it spins this long for the next one before sleeping
+    // (APS5_COMPARE_HELPER_SPIN_US, default 200; 0 sleeps at once).
+    static std::chrono::microseconds spinTime() {
+        static const auto time = [] {
+            const char* value = std::getenv("APS5_COMPARE_HELPER_SPIN_US");
+            return std::chrono::microseconds(value == nullptr ? 200 : std::strtol(value, nullptr, 10));
+        }();
+        return time;
+    }
+
+    void spinForJob(std::uint64_t seen) const {
+        const auto until = std::chrono::steady_clock::now() + spinTime();
+        while (published.load(std::memory_order_acquire) == seen && !stopRequested.load(std::memory_order_acquire)) {
+            for (int pause = 0; pause < 64; ++pause) _mm_pause();
+            if (std::chrono::steady_clock::now() >= until) return;
+        }
+    }
+
     std::uint64_t generation = 0;
+    std::atomic<std::uint64_t> published{0};
+    std::atomic<bool> stopRequested{false};
     unsigned working = 0;
     std::size_t jobCount = 0;
     HelperJob jobRun = nullptr;
