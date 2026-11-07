@@ -3891,15 +3891,61 @@ bool Recorder::RetireOldest() {
     return true;
 }
 
+namespace {
+struct KeptWaits {
+    std::atomic<std::uint64_t> waits{0}, ns{0}, keptMiB{0}, batches{0}, submits{0}, destroys{0};
+};
+KeptWaits& KeptWaitCounts() {
+    static KeptWaits waits;
+    return waits;
+}
+bool KeptWaitsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_WAITS") != nullptr;
+    return profiled;
+}
+}
+
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
-    if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
+    const bool profiled = KeptWaitsProfiled();
+    if (open != nullptr && open->keptBytes >= KeptBytesBudget) {
+        Submit();
+        if (profiled) KeptWaitCounts().submits.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) {
+        DestroyDeferred(TakeDeferred(), false);
+        if (profiled) KeptWaitCounts().destroys.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool waits = profiled && !inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget;
+    const auto start = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto keptBefore = inFlightKeptBytes;
+    std::uint64_t finished = 0;
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), true, 4, true);
+        ++finished;
     }
+    if (waits) {
+        auto& counts = KeptWaitCounts();
+        counts.waits.fetch_add(1, std::memory_order_relaxed);
+        counts.batches.fetch_add(finished, std::memory_order_relaxed);
+        counts.keptMiB.fetch_add(keptBefore >> 20u, std::memory_order_relaxed);
+        counts.ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+}
+
+std::string Recorder::KeptWaitReport() {
+    auto& counts = KeptWaitCounts();
+    const auto waits = counts.waits.exchange(0, std::memory_order_relaxed);
+    const auto ns = counts.ns.exchange(0, std::memory_order_relaxed);
+    const auto kept = counts.keptMiB.exchange(0, std::memory_order_relaxed);
+    const auto batches = counts.batches.exchange(0, std::memory_order_relaxed);
+    const auto submits = counts.submits.exchange(0, std::memory_order_relaxed);
+    const auto destroys = counts.destroys.exchange(0, std::memory_order_relaxed);
+    char text[320];
+    std::snprintf(text, sizeof(text), "[kept-wait] BoundKeptBytes waits (10 s): %llu in %.1f ms for %llu batches (in-flight kept at the wait %.0f MiB avg, bound %zu MiB); open-batch submits at the budget %llu, deferred destroys %llu", static_cast<unsigned long long>(waits), ns / 1e6, static_cast<unsigned long long>(batches), waits != 0 ? static_cast<double>(kept) / static_cast<double>(waits) : 0.0, (2 * KeptBytesBudget) >> 20u, static_cast<unsigned long long>(submits), static_cast<unsigned long long>(destroys));
+    return text;
 }
 
 namespace {

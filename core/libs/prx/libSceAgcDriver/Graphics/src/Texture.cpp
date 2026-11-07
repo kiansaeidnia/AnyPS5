@@ -218,8 +218,13 @@ std::atomic<std::uint64_t> untrackedCompares{0};
 
 namespace {
 
+bool WaitCausesProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_WAITS") != nullptr;
+    return profiled;
+}
+
 bool FlushWaitsProfiled() {
-    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || WaitCausesProfiled();
     return profiled;
 }
 
@@ -4985,8 +4990,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     bool deferWriter = false;
     bool leaseWait = false;
     bool leaseSample = false;
+    const char* waitCause = deferFlip || deferLabel || ordered >= 0 || refreshAlone ? "recorder inactive" : "reason not GPU-ordered";
     if ((deferFlip || deferLabel || ordered >= 0 || refreshAlone) && Recorder::Active() != nullptr && !Recorder::InCompletion()) {
         deferWriter = std::all_of(flush.begin(), flush.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
+        if (!deferWriter) waitCause = "image without a host import";
         if (deferWriter && ordered >= 0) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
             for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, ranges);
@@ -4994,8 +5001,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             if (refusal) {
                 deferWriter = false;
                 gpuOrderRefusals[static_cast<std::size_t>(*refusal)].fetch_add(1, std::memory_order_relaxed);
+                waitCause = *refusal == GpuOrderRefusal::Unwatched ? "refused: outside the write watch" : *refusal == GpuOrderRefusal::Completion ? "refused: copied writer or completion store" : "refused: async-lane writer";
             } else if (RuntimeSwitches::Set(RuntimeSwitch::NoDeferOverLeases) || leaseGuardTripped.load(std::memory_order_relaxed)) {
                 leaseWait = true;
+                waitCause = "lease (always waited)";
             } else {
                 // A lease still pending over the stored layers (finished batches retired first) is skipped, except
                 // for the guard's samples.
@@ -5007,6 +5016,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                         const auto interval = RuntimeSwitches::Set(RuntimeSwitch::NoLeaseGuard) ? 0 : LeaseSampleInterval();
                         leaseSample = interval != 0 && gpuOrderLeaseCovered.fetch_add(1, std::memory_order_relaxed) % interval == 0;
                         leaseWait = leaseSample;
+                        if (leaseSample) waitCause = "lease guard sample";
                         (leaseSample ? gpuOrderLeaseSampled : gpuOrderLeaseSkipped).fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -5090,7 +5100,12 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     if (profiled) {
                         const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
                         const bool stamped = std::any_of(stored.begin(), stored.end(), [&](const auto& range) { return range.second > range.first && GuestMemory::WrittenSince(range.first, static_cast<std::size_t>(range.second - range.first), generationBefore); });
-                        NoteFlushWait(reason, byLane, openWriter, wait, waitedMs, source, stamped);
+                        if (WaitCausesProfiled()) {
+                            const std::string key = std::string(reason != nullptr ? reason : "other") + " [" + waitCause + "]";
+                            NoteFlushWait(key.c_str(), byLane, openWriter, wait, waitedMs, source, stamped);
+                        } else {
+                            NoteFlushWait(reason, byLane, openWriter, wait, waitedMs, source, stamped);
+                        }
                     }
                 }
                 if (leaseWait && writer != 0) {
@@ -5409,6 +5424,30 @@ StorageTexture::GpuOrderCounts StorageTexture::GpuOrderTotals() {
     counts.leaseSampled = gpuOrderLeaseSampled.load(std::memory_order_relaxed);
     counts.leaseGuardTripped = leaseGuardTripped.load(std::memory_order_relaxed);
     return counts;
+}
+
+std::string StorageTexture::WaitReport() {
+    static std::array<std::uint64_t, GpuOrderedReasons.size()> lastOrdered{};
+    static GpuOrderCounts lastOrder{};
+    static std::uint64_t lastRefresh = 0, lastLabels = 0;
+    std::string report = FlushWaitReport();
+    report += "\n[gpu-order] GPU-ordered write-backs (10 s):";
+    char text[512];
+    for (std::size_t index = 0; index < GpuOrderedReasons.size(); ++index) {
+        const auto total = gpuOrderedFlushes[index].load(std::memory_order_relaxed);
+        std::snprintf(text, sizeof(text), " %s %llu", GpuOrderedReasons[index], static_cast<unsigned long long>(total - lastOrdered[index]));
+        report += text;
+        lastOrdered[index] = total;
+    }
+    const auto order = GpuOrderTotals();
+    const auto refresh = deferredRefreshFlushes.load(std::memory_order_relaxed);
+    const auto labels = deferredLabelReadbacksTotal.load(std::memory_order_relaxed);
+    std::snprintf(text, sizeof(text), "; refresh-alone %llu, label read-backs %llu; refused: unwatched %llu, completions %llu, lane %llu; lease waits %llu (%llu stamped), leases skipped %llu, sampled %llu%s", static_cast<unsigned long long>(refresh - lastRefresh), static_cast<unsigned long long>(labels - lastLabels), static_cast<unsigned long long>(order.unwatched - lastOrder.unwatched), static_cast<unsigned long long>(order.completions - lastOrder.completions), static_cast<unsigned long long>(order.lane - lastOrder.lane), static_cast<unsigned long long>(order.leaseWaits - lastOrder.leaseWaits), static_cast<unsigned long long>(order.leaseStamped - lastOrder.leaseStamped), static_cast<unsigned long long>(order.leaseSkipped - lastOrder.leaseSkipped), static_cast<unsigned long long>(order.leaseSampled - lastOrder.leaseSampled), order.leaseGuardTripped ? ", lease guard tripped" : "");
+    report += text;
+    lastOrder = order;
+    lastRefresh = refresh;
+    lastLabels = labels;
+    return report;
 }
 
 const char* StorageTexture::CurrentFlushReason() {

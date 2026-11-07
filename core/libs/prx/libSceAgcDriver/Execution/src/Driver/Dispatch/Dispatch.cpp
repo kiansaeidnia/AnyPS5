@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -79,6 +80,54 @@ std::atomic<std::uint64_t> missItemRefusals{0};
 
 void NoteItemFallback(ItemFallback reason) {
     itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+enum class DrainSite : std::size_t { Indirect, Labels, Kernel, NotCandidate, Htile, Miss, Verify, Reads, NoRecipe, Writes, MissWrites, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> DrainSiteNames{"indirect", "deferred labels", "copy kernel", "other non-candidate", "htile clear", "cache miss", "verify", "reads overlap queued writes", "no recipe", "unbounded writes", "miss item writes"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainSite::Count)> drainSiteCounts{}, drainSiteNs{};
+
+bool WaitsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_WAITS") != nullptr;
+    return profiled;
+}
+
+void DrainFor(DrainSite site) {
+    auto& pipeline = DrawPipeline::Queue0();
+    if (!WaitsProfiled()) {
+        pipeline.Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        return;
+    }
+    const bool busy = pipeline.Busy();
+    const auto start = std::chrono::steady_clock::now();
+    pipeline.Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    if (!busy) return;
+    drainSiteCounts[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    drainSiteNs[static_cast<std::size_t>(site)].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+void ReportWaits() {
+    static std::atomic<std::int64_t> next{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto due = next.load(std::memory_order_relaxed);
+    if (now < due) return;
+    if (!next.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count())) return;
+    if (due == 0) return;
+    std::string drained;
+    for (std::size_t i = 0; i < ItemFallbackNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].exchange(0, std::memory_order_relaxed)));
+        drained += item;
+    }
+    std::string sites;
+    for (std::size_t i = 0; i < DrainSiteNames.size(); ++i) {
+        const auto count = drainSiteCounts[i].exchange(0, std::memory_order_relaxed);
+        const auto ns = drainSiteNs[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu/%.1f", DrainSiteNames[i], static_cast<unsigned long long>(count), ns / 1e6);
+        sites += item;
+    }
+    std::fprintf(stderr, "[dispatch-item] (10 s) %llu commit items (%llu rebuilt), %llu miss items (%llu refused); fallbacks:%s\n[dispatch-drain] busy draw-pipeline drains by site (count/ms, 10 s):%s\n%s\n%s\n", static_cast<unsigned long long>(itemCommits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.exchange(0, std::memory_order_relaxed)), drained.c_str(), sites.c_str(), Graphics::StorageTexture::WaitReport().c_str(), Graphics::Recorder::KeptWaitReport().c_str());
 }
 
 void ReportDispatchItems(bool profile) {
@@ -150,6 +199,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
 void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, bool forceFresh) {
     PerformanceTimer timing("Driver.Dispatch");
+    if (WaitsProfiled()) ReportWaits();
     // Both switches once per attempt: an A/B flip (at a queue-0 present) never splits one.
     const bool itemsOn = DispatchItemsEnabled();
     const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
@@ -282,9 +332,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) DrainFor(indirectArguments != 0 ? DrainSite::Indirect : !deferredLabels().labels.empty() ? DrainSite::Labels : itemsOn && !resolving && !fromAhead ? DrainSite::Kernel : DrainSite::NotCandidate);
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
-            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainFor(DrainSite::Htile);
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             const auto bytes = static_cast<std::size_t>(threads * 16u);
@@ -292,7 +342,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             if (nativeBytes != 0u && userData.size() >= 6u) htileMask = {htile, nativeBytes, userData[5], userData[4]};
         } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments); buffered.has_value() && (buffered->mask & 0xfu) == 0u && (buffered->value & 0xfu) == 0u) {
             // S1: the buffer variant of the mask kernel, read the same way (zmask cleared: a depth clear).
-            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainFor(DrainSite::Htile);
             if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
             htileMask = {buffered->address, buffered->bytes, buffered->mask, buffered->value};
         }
@@ -474,17 +524,20 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
             }
         }
+        auto readsSite = DrainSite::Miss;
         if (!entryFound && !noDispatchCache && !stampValidate() && missItemsOn) {
             readsClear = true;
         } else if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
+            readsSite = DrainSite::Verify;
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+            readsSite = DrainSite::Reads;
         }
-        if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && DrawPipeline::Queue0().Busy()) DrainFor(readsSite);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -511,17 +564,19 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     bool pipelined = false;
     bool missItem = false;
     if (readsClear) {
+        auto pipeSite = DrainSite::NoRecipe;
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded && !NoDispatchItems();
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
+            pipeSite = DrainSite::Writes;
         } else if (missItemsOn && !NoDispatchItems()) {
             missItem = true;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
         }
-        if (!pipelined && !missItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !missItem && DrawPipeline::Queue0().Busy()) DrainFor(pipeSite);
     }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
@@ -632,7 +687,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         if (!bounded || !deferredLabels().labels.empty()) {
             missItem = false;
             NoteItemFallback(ItemFallback::Writes);
-            if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (DrawPipeline::Queue0().Busy()) DrainFor(DrainSite::MissWrites);
         }
     }
     phaseTiming.Phase(PhaseQueuedLabels);
