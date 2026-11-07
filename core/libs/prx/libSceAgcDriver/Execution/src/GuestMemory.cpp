@@ -3263,16 +3263,20 @@ void ReadCommittedHashed(std::uint64_t address, std::span<std::byte> destination
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
+    // One accessibility check for the whole range: while every page is readable each block is a plain copy,
+    // otherwise each block is read as ReadCommitted reads it (APS5_NO_WHOLE_RANGE_READ checks every block).
     struct Job {
         std::uint64_t address;
         std::span<std::byte> destination;
         std::span<ContentHash::Hash128> out;
-    } job{address, destination, out};
+        bool whole;
+    } job{address, destination, out, !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoWholeRangeRead) && Accessible(reinterpret_cast<const void*>(address), destination.size())};
     const auto readBlock = [](void* context, std::size_t index) {
         const auto& state = *static_cast<const Job*>(context);
         const auto [begin, length] = hashBlockAt(state.address, state.destination.size(), index);
         const auto block = state.destination.subspan(static_cast<std::size_t>(begin - state.address), length);
-        copyCommitted(begin, block);
+        if (state.whole) std::memcpy(block.data(), reinterpret_cast<const void*>(begin), length);
+        else copyCommitted(begin, block);
         state.out[index] = ContentHash::Of(block.data(), length);
     };
     if (parallelHash(destination.size()) && Graphics::RunOnCompareHelpers(out.size(), readBlock, &job)) return;
