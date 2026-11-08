@@ -103,6 +103,9 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_V3E_BUFFER_FLAGS",
     "APS5_V3E_INPUT_FLAGS",
     "APS5_V3E_TEXTURE_ROOM",
+    "APS5_V3E_DEEP_PIPELINE",
+    "APS5_V3E_MID_PIPELINE",
+    "APS5_V3E_DRAW_PROOF_MEMO",
     "APS5_V3M_ADDR_CEIL",
     "APS5_NO_DEFER_STORES",
     "APS5_DEFER_UNWATCHED",
@@ -115,6 +118,13 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DIRECT_SNAPSHOT_STAGING",
     "APS5_NO_FUSED_SNAPSHOT_HASH",
     "APS5_NO_PARALLEL_BLOCK_HASH",
+    "APS5_V3M_STORAGE_TOKENS",
+    "APS5_V3M_PROBE_MEMO",
+    "APS5_V3M_PREPARE_STAMP",
+    "APS5_V3E_LOCK_SPLIT",
+    "APS5_V3E_PREPARE_PROOF",
+    "APS5_V3E_PP_PUBLISH_ONLY",
+    "APS5_V3E_PP_NO_PUBLISH",
 };
 
 struct Refusal {

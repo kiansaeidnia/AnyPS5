@@ -105,6 +105,9 @@ enum class RuntimeSwitch : std::size_t {
     V3eBindingFlags,
     V3eInputFlags,
     V3eTextureRoom,
+    V3eDeepPipeline,
+    V3eMidPipeline,
+    V3eDrawProofMemo,
     V3mAddrCeil,
     NoDeferStores,
     DeferUnwatched,
@@ -117,6 +120,13 @@ enum class RuntimeSwitch : std::size_t {
     NoDirectSnapshotStaging,
     NoFusedSnapshotHash,
     NoParallelBlockHash,
+    V3mStorageTokens,
+    V3mProbeMemo,
+    V3mPrepareStamp,
+    V3eLockSplit,
+    V3ePrepareProof,
+    V3ePpPublishOnly,
+    V3ePpNoPublish,
     Count,
 };
 

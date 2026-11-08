@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
@@ -37,6 +38,14 @@
 #include <typeinfo>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+// v3 exec (b)/(a): a draw whose stages store through BDA/pointers has writes DrawWriteRanges cannot list.
+bool storesThroughPointers(std::span<const Graphics::CompiledShader> stages) {
+    return std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr && stage.program->bdaWrites; });
+}
+}
+
 
 namespace {
 
@@ -286,10 +295,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowPrecheck);
 
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    std::optional<AgcDriver::LockOrder::StageHold> stageHold;
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
+        stageHold.emplace();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -958,6 +969,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
+        stageHold.emplace();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
 
@@ -1006,6 +1018,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 for (const auto& item : expanded) commitDraw(localDevice, commitQueue, decode->state, item.direct, item.stages, item.snapshots, nullptr, {}, 0);
             };
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
+            if (std::any_of(expanded.begin(), expanded.end(), [](const ExpandedDraw& item) { return storesThroughPointers(item.stages); })) DrawPipeline::NextWritesUnknown();
             pipeline.Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
             pipeline.Note(DrawPipeline::Event::IndirectCommit);
             phaseTiming.Phase(DrawRowLockWait);
@@ -1170,6 +1183,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, nullptr);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
+                if (storesThroughPointers(stages)) DrawPipeline::NextWritesUnknown();
                 DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
@@ -1272,6 +1286,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             };
         }
         timing.Mark("write_ranges_and_commit");
+        if (storesThroughPointers(stages)) DrawPipeline::NextWritesUnknown();
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), std::move(prepare), true);
         if (pipelineIndirect) DrawPipeline::Queue0().Note(DrawPipeline::Event::IndirectCommit);
         phaseTiming.Phase(DrawRowLockWait);
@@ -1303,6 +1318,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const AgcDriver::LockOrder::StageHold stageHold;
     if (auto current = device.Load(); current != nullptr && current != localDevice) {
         localDevice = std::move(current);
         prepared = nullptr;

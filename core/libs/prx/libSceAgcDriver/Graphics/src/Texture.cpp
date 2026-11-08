@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -73,7 +74,7 @@ Counts& counts() {
 }
 
 int Mode() {
-    static const int mode = [] {
+    static const int checked = [] {
         const char* value = std::getenv("APS5_V3M_STORAGE_TOKENS");
         if (value == nullptr || !GuestMemory::DirtyEnabled()) return 0;
         const std::string_view text(value);
@@ -81,7 +82,9 @@ int Mode() {
         if (text == "verify") return 2;
         return 1;
     }();
-    return mode;
+    if (checked >= 2) return checked;
+    if (!GuestMemory::DirtyEnabled()) return 0;
+    return RuntimeSwitches::Set(RuntimeSwitch::V3mStorageTokens) ? 1 : 0;
 }
 
 void Violation(const char* what, std::uint64_t address, std::uint64_t bytes) {
@@ -2632,12 +2635,15 @@ bool StorageTexture::tokenEligible() const {
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const int mode = StorageTokens::Mode();
-    if (mode == 0) return refreshBody(firstLayer, lastLayer);
+    if (mode == 0) {
+        syncToken = 0;
+        return refreshBody(firstLayer, lastLayer);
+    }
     auto& counts = StorageTokens::counts();
     counts.refreshes.fetch_add(1, std::memory_order_relaxed);
     if (firstLayer != 0 || lastLayer != trackedLayers || !tokenEligible()) {
         syncToken = 0;
-        return refreshBody(firstLayer, lastLayer);
+        return refreshFull(firstLayer, lastLayer);
     }
     counts.eligible.fetch_add(1, std::memory_order_relaxed);
     const auto base = descriptor.baseAddress;
@@ -2655,10 +2661,11 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const auto token = clean ? syncToken : other ? 0 : GuestMemory::DirtyArmAs(base, bytes, GuestArena::ArmStorage);
     if (!clean && !other && token == 0) counts.armRefused.fetch_add(1, std::memory_order_relaxed);
     syncToken = 0;
-    const bool current = refreshBody(firstLayer, lastLayer);
+    const auto versionBefore = Version();
+    const bool current = refreshFull(firstLayer, lastLayer);
     if (clean) {
         counts.verified.fetch_add(1, std::memory_order_relaxed);
-        if (!current) {
+        if (!current || Version() != versionBefore) {
             counts.violations.fetch_add(1, std::memory_order_relaxed);
             StorageTokens::Violation("a storage image the token called current was refreshed", base, bytes);
         }
@@ -5853,6 +5860,18 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
     return false;
 }
 
+namespace {
+
+const bool storageFactCheck = [] {
+    GuestMemory::SetRegistryCheck(GuestMemory::Registry::StorageResults, [](std::uint64_t address, std::uint64_t bytes, std::uint64_t fact) {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+        return StorageTexture::AnyPendingOverlaps(range) == (fact != 0);
+    });
+    return true;
+}();
+
+}
+
 bool StorageTexture::AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     auto& live = Live();
     std::lock_guard lock(live.mutex);
@@ -6032,6 +6051,7 @@ StorageTexture::HookSkipCounts StorageTexture::TakeHookSkipCounts() {
 }
 
 void StorageTexture::BumpPendingSerial() {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::StorageResults);
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 
@@ -6960,6 +6980,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const int mode = StorageTokens::Mode();
     if (mode == 0) {
+        syncToken = 0;
         writeBackLayersBody(layers);
         return;
     }

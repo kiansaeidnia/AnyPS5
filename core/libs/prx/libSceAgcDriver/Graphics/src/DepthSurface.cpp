@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -1682,8 +1683,8 @@ bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
     return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.samples == b.samples && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.stencilSwizzle == b.stencilSwizzle && (a.samples == 1u || (a.depthSwizzle == b.depthSwizzle && a.pipeBankXor == b.pipeBankXor && a.firstSlice == b.firstSlice && a.lastSlice == b.lastSlice && a.iterate256 == b.iterate256 && a.htilePipeAligned == b.htilePipeAligned && a.htileVrsEncoding == b.htileVrsEncoding && a.htileDepthOnly == b.htileDepthOnly));
 }
 
-std::recursive_mutex& surfacesMutex() {
-    static std::recursive_mutex mutex;
+AgcDriver::LockOrder::SplitMutex<std::recursive_mutex, AgcDriver::LockOrder::Rank::DepthDcc>& surfacesMutex() {
+    static AgcDriver::LockOrder::SplitMutex<std::recursive_mutex, AgcDriver::LockOrder::Rank::DepthDcc> mutex;
     return mutex;
 }
 
@@ -2705,6 +2706,13 @@ DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const D
 bool DepthPlanesStale() {
     auto& planes = stalePlanes();
     return planes.begin.load(std::memory_order_acquire) < planes.end.load(std::memory_order_acquire);
+}
+
+bool DepthPlanesStale(std::uint64_t address, std::size_t bytes) {
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (!overlapsStalePlane(address, end)) return false;
+    std::lock_guard lock(surfacesMutex());
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->AnyStale() && ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || anyUnit(surface->StaleUnitsIn(DescribeSurface(mirrorResource(surface->target)).guestBytes, address, end))); });
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope) {

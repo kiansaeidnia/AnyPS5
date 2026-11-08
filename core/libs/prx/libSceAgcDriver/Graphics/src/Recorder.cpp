@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -1267,6 +1268,7 @@ Recorder::~Recorder() {
         activeRecorder = nullptr;
         pendingWrites.store(nullptr, std::memory_order_release);
         publishGeneration.fetch_add(1, std::memory_order_release);
+        GuestMemory::BumpRegistry(GuestMemory::Registry::PendingWrites);
         pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
         completionLabels.store(0, std::memory_order_release);
         completionStores.store(0, std::memory_order_release);
@@ -4560,6 +4562,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     published = incremental.snapshot;
     pendingWrites.store(std::move(incremental.snapshot), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
+    GuestMemory::BumpRegistry(GuestMemory::Registry::PendingWrites);
     if (incremental.rebuilt) ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
@@ -4975,6 +4978,7 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         std::memcpy(&value, bytes.data() + offset, 4);
         const auto dword = address + offset;
         labels.insert_or_assign(dword, LabelEntry{value, queue, stamp, &batch, 0, false, behindCompletion});
+        GuestMemory::BumpRegistry(GuestMemory::Registry::Labels);
         batch.labelDwords.push_back(dword);
         LabelGroupDwords().emplace_back(dword, stamp);
     }
@@ -4998,6 +5002,7 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
     } else {
         std::lock_guard tableLock(labelTableMutex);
         labels.erase(labels.lower_bound(address), labels.lower_bound(address + bytes.size()));
+        GuestMemory::BumpRegistry(GuestMemory::Registry::Labels);
         recordedLabels.store(labels.size(), std::memory_order_relaxed);
         open->wideLabels.push_back(wideLabels.emplace(address, address + bytes.size()));
         wideLabelBytes = std::max<std::uint64_t>(wideLabelBytes, bytes.size());
@@ -6052,6 +6057,7 @@ void Recorder::removeLabels(Batch& batch) {
         for (const auto dword : batch.labelDwords) {
             const auto found = labels.find(dword);
             if (found != labels.end() && found->second.batch == &batch) labels.erase(found);
+            GuestMemory::BumpRegistry(GuestMemory::Registry::Labels);
         }
         for (const auto entry : batch.wideLabels) wideLabels.erase(entry);
         recordedLabels.store(labels.size(), std::memory_order_relaxed);

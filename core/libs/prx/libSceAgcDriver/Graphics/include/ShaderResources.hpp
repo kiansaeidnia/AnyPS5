@@ -1,7 +1,9 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -15,8 +17,10 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <tuple>
 #include <optional>
 #include <span>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -407,6 +411,24 @@ public:
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults(std::uint64_t shaderAddress = 0) const;
     bool InUse() const { return usesInFlight->load(std::memory_order_acquire) != 0; }
+    // The guest ranges a draw-set proof reads (direct regions, described ranges, storage images, validated textures,
+    // with their DCC keys): the prepare-shadow census's read set.
+    void ForEachReadRange(const std::function<void(std::uint64_t, std::uint64_t)>& add) const;
+    // v3 lock split phase (ii) (APS5_V3E_PREPARE_PROOF): the read-only part of revalidateFull, run by the preparer
+    // under the shared resource-set lock. Pass only when today's proof would pass on its fast path with no flush,
+    // refresh, upload, import creation or recorder call (no DCC keys, no depth surfaces, every range write-watched);
+    // the commit then serves the set when the prepare-time read set validates (revalidateFull's prepared path).
+    enum class Ahead : std::uint8_t { Pass, NotReusable, AddressBased, Other, Audit, Depth, Keys, Untracked, Evicted, Pending, Shadows, Imports, Changed, Count };
+    // The fields ProveAhead reads, published by each commit of the set (RCU-style: an immutable copy swapped in, kept
+    // alive by the reader's reference), so the preparer reads them without any lock the commit's stage hold takes.
+    struct ProofView;
+    std::shared_ptr<const ProofView> LoadProofView() const { return proofView.load(std::memory_order_acquire); }
+    void PublishProofView();
+    static Ahead ProveAhead(const ProofView& view);
+    // The view's read ranges (ForEachReadRange) with whether a copied writer of the set overlaps each, and its lease.
+    static void ForEachViewRange(const ProofView& view, const std::function<void(std::uint64_t, std::uint64_t, bool)>& add);
+    static bool ViewHoldsLease(const ProofView& view);
+    static const char* AheadName(Ahead result);
     bool ReusesAddressSpace() const { return addressReuse; }
     std::shared_ptr<const void> BeginUse();
     void CompleteUse();
@@ -628,6 +650,14 @@ private:
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     bool proveBuild(std::span<const CompiledShader> shaders, ProofReport* report);
+    // v3 lever A for draw sets (APS5_V3E_DRAW_PROOF_MEMO, runtime switch): proveBuild's answer reused while the
+    // per-cause proof serial and the pending serial are unchanged and the tracker calls every range the proof reads clean
+    // since the tokens armed before the last full proof; APS5_V3E_DRAW_PROOF_MEMO_VERIFY re-proves and throws.
+    bool proveDrawMemo(std::span<const CompiledShader> shaders, ProofReport* report);
+    std::vector<ImageFlags::DirtyQuery> memoTokens;
+    std::uint64_t memoCaused = 0;
+    std::uint64_t memoPending = 0;
+    bool memoValid = false;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -651,6 +681,31 @@ private:
         std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
         std::array<std::uint64_t, 4> untracked{};
     };
+public:
+    struct ProofView {
+        struct Surface {
+            std::uint64_t address;
+            std::uint64_t bytes;
+            const StorageTexture* source;
+        };
+        bool reusable = false;
+        bool addressBased = false;
+        bool holdsLease = false;
+        const Context* context = nullptr;
+        std::vector<ValidatedSurface> surfaces;
+        std::vector<std::shared_ptr<Texture>> textures;
+        std::vector<std::shared_ptr<StorageTexture>> storage;
+        std::vector<std::uint64_t> storageKeys;
+        std::vector<std::array<std::uint64_t, 4>> storageUntracked;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> regions;
+        std::vector<std::tuple<std::uint64_t, std::uint64_t, bool>> reads;
+        HostImportsProof importsProof;
+    };
+private:
+    std::atomic<std::shared_ptr<const ProofView>> proofView;
+    // Phase (ii) at the commit, when the storage-results or shadow registry moved since prepare: the proof's pending
+    // and shadow checks over the current set (exact facts in place of the serial).
+    bool pendingClearNow() const;
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
@@ -784,8 +839,10 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
+    std::uint64_t provedCaused = 0;
     std::uint64_t provedPending = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool revalidateFullBody(std::span<const CompiledShader> shaders, ProofReport* report, bool prepared, bool verify, bool& served);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
@@ -915,7 +972,7 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
-    mutable AgcDriver::Mutex mutex;
+    mutable AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::ResourceSet> mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
     // The entries by each sampled texture they bind (once per entry): RemoveTextures without a scan.

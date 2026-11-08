@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -16,6 +18,21 @@
 namespace AgcDriver::Graphics {
 
 namespace {
+
+struct StampRank {
+    bool noted = LockOrder::CheckEnabled();
+    StampRank() {
+        if (!noted) return;
+        LockOrder::BeforeAcquire(LockOrder::Rank::Residency);
+        LockOrder::NoteHeld(LockOrder::Rank::Residency);
+    }
+    ~StampRank() {
+        if (noted) LockOrder::NoteReleased(LockOrder::Rank::Residency);
+    }
+    StampRank(const StampRank&) = delete;
+    StampRank& operator=(const StampRank&) = delete;
+};
+
 
 constexpr std::uint64_t DefaultResidentBytes = std::uint64_t{1024} << 20u;
 
@@ -159,7 +176,7 @@ void ResidencyDriver::DisableFaults() {
 }
 
 void ResidencyDriver::AccessFault(std::uint64_t address) {
-    if (GuestMemory::GpuMutex().HeldByThisThread() || faultServer == nullptr) {
+    if (AgcDriver::LockOrder::MustNotWait() || faultServer == nullptr) {
         refusedFaults.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -260,14 +277,17 @@ ResidencyToken ResidencyDriver::WriteBack(std::span<const ResidencyCopy> copies)
     if (copies.empty()) return token;
     PendingStamp pending{token, {}};
     for (const auto& copy : copies) pending.ranges.emplace_back((copy.page << ResidencyPageShift) + copy.offset, copy.bytes);
+    const StampRank stampRank;
     const std::lock_guard lock(stampMutex);
     pendingStamps.push_back(std::move(pending));
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
     stampsPending.store(true, std::memory_order_release);
     return token;
 }
 
 bool ResidencyDriver::stampPending(std::uint64_t address, std::size_t bytes) {
     if (!stampsPending.load(std::memory_order_acquire)) return false;
+    const StampRank stampRank;
     const std::lock_guard lock(stampMutex);
     for (const auto& pending : pendingStamps) {
         for (const auto& [begin, length] : pending.ranges) {
@@ -281,12 +301,14 @@ void ResidencyDriver::stampWrittenBack(std::uint64_t address, std::size_t bytes,
     if (!stampsPending.load(std::memory_order_acquire)) return;
     std::vector<PendingStamp> due;
     {
-        const std::lock_guard lock(stampMutex);
+        const StampRank stampRank;
+    const std::lock_guard lock(stampMutex);
         for (auto at = pendingStamps.begin(); at != pendingStamps.end();) {
             const bool overlaps = std::any_of(at->ranges.begin(), at->ranges.end(), [&](const auto& range) { return range.first < address + bytes && address < range.first + range.second; });
             if ((all && tokens.Reached(at->token)) || (!all && overlaps)) {
                 due.push_back(std::move(*at));
                 at = pendingStamps.erase(at);
+                GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
             } else {
                 ++at;
             }

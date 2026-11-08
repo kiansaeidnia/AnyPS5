@@ -47,11 +47,12 @@ std::atomic<std::uint64_t> mappingEpoch{1};
 std::atomic<int> forced{-1};
 
 struct Counters {
-    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0}, renewRefused{0}, lateFaults{0}, declined{0};
+    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0}, renewRefused{0}, lateFaults{0}, declined{0}, retriedFaults{0}, armWaits{0}, armWaitNs{0};
     std::atomic<std::uint64_t> refusedBy[4][8]{};
     std::atomic<std::uint64_t> armsBy[4]{};
 };
 thread_local unsigned armKind = 0;
+thread_local unsigned lastRefusal = 0;
 std::atomic<std::uintptr_t> lastDeclined{0};
 std::atomic<std::uint64_t> lastDeclinedState{0};
 struct OwnWindow {
@@ -114,7 +115,11 @@ std::uint32_t threadToken() {
 #endif
 }
 
+thread_local unsigned blockLocksHeld = 0;
+thread_local bool inFaultHandler = false;
+
 void lockBlock(Block& block) {
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyBlock, blockLocksHeld == 0 && !inFaultHandler ? GuestArena::GuestLockBefore : GuestArena::GuestLockHeldUnchecked);
     std::uint32_t expected = 0;
     const auto self = threadToken();
     while (!block.lock.compare_exchange_weak(expected, self, std::memory_order_acquire)) {
@@ -123,10 +128,13 @@ void lockBlock(Block& block) {
         YieldProcessor();
 #endif
     }
+    if (blockLocksHeld++ == 0 && !inFaultHandler) GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyBlock, GuestArena::GuestLockHeld);
 }
 
 void unlockBlock(Block& block) {
     block.lock.store(0, std::memory_order_release);
+    if (blockLocksHeld != 0) --blockLocksHeld;
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyBlock, GuestArena::GuestLockReleased);
 }
 
 std::uint32_t pageMask(std::uintptr_t blockBase, std::uintptr_t begin, std::uintptr_t end) {
@@ -220,7 +228,11 @@ void GuestDirtyForceEnable_nid_no_patch(bool on) {
 
 std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #ifdef _WIN32
-    if (!enabled() || bytes == 0 || address + bytes < address) return 0;
+    if (!enabled() || bytes == 0 || address + bytes < address) {
+        lastRefusal = GuestArena::RefusedDisabled + 1;
+        return 0;
+    }
+    lastRefusal = 0;
     const auto start = nowNs();
     const auto begin = address & ~(PageBytes - 1);
     const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
@@ -233,6 +245,7 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         if (block != nullptr && block->refusedEpoch.load(std::memory_order_acquire) == epoch) {
             counters.refused.fetch_add(1, std::memory_order_relaxed);
             counters.refusedBy[armKind][GuestArena::RefusedEpoch].fetch_add(1, std::memory_order_relaxed);
+            lastRefusal = GuestArena::RefusedEpoch + 1;
             counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
             return 0;
         }
@@ -247,10 +260,22 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
         return token;
     }
-    std::lock_guard lock(armMutex);
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockBefore);
+    std::unique_lock lock(armMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        const auto waitStart = nowNs();
+        lock.lock();
+        counters.armWaits.fetch_add(1, std::memory_order_relaxed);
+        counters.armWaitNs.fetch_add(nowNs() - waitStart, std::memory_order_relaxed);
+    }
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockHeld);
+    struct ArmReleased {
+        ~ArmReleased() { GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockReleased); }
+    } armReleased;
     const auto refuse = [&](unsigned reason) {
         counters.refused.fetch_add(1, std::memory_order_relaxed);
         counters.refusedBy[armKind][reason & 7u].fetch_add(1, std::memory_order_relaxed);
+        lastRefusal = (reason & 7u) + 1;
         counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
         return std::uint64_t{0};
     };
@@ -349,6 +374,10 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
 #endif
 }
 
+unsigned GuestDirtyTakeLastRefusal_nid_postfix() {
+    return std::exchange(lastRefusal, 0u);
+}
+
 bool GuestDirtyCleanSince_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t token) {
     if (token == 0 || bytes == 0 || !enabled()) return false;
     counters.cleanQueries.fetch_add(1, std::memory_order_relaxed);
@@ -421,33 +450,66 @@ void GuestDirtyBump_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 bool GuestDirtyHandleWrite_nid_postfix(std::uintptr_t address) {
 #ifdef _WIN32
     if (!enabled()) return false;
+    struct FaultScope {
+        bool outer = std::exchange(inFaultHandler, true);
+        ~FaultScope() { inFaultHandler = outer; }
+    } faultScope;
     const auto blockBase = address & ~(BlockBytes - 1);
     auto* block = findBlock(blockBase);
     if (block == nullptr) return false;
     const auto bit = 1u << ((address - blockBase) / PageBytes);
-    if ((block->armed.load(std::memory_order_seq_cst) & bit) == 0 && tracked(*block) == 0 && block->lock.load(std::memory_order_acquire) == 0 && block->opened.load(std::memory_order_relaxed) == 0) return false;
-    const auto start = nowNs();
-    const bool own = block->lock.load(std::memory_order_acquire) == threadToken();
-    if (!own) lockBlock(*block);
-    bool served = true;
-    if ((block->armed.load(std::memory_order_seq_cst) & bit) != 0) {
-        disarmLocked(blockBase, *block);
-        counters.faults.fetch_add(1, std::memory_order_relaxed);
-    } else {
+    const auto armed = [&] { return (block->armed.load(std::memory_order_seq_cst) & bit) != 0; };
+    DWORD type = 0;
+    const auto writable = [&](DWORD* protection) {
         MEMORY_BASIC_INFORMATION memory{};
         const bool queried = VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == sizeof(memory);
-        served = queried && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
-        if (served) {
-            counters.lateFaults.fetch_add(1, std::memory_order_relaxed);
-        } else if (tracked(*block) != 0 || block->opened.load(std::memory_order_relaxed) != 0) {
-            counters.declined.fetch_add(1, std::memory_order_relaxed);
-            lastDeclined.store(address, std::memory_order_relaxed);
-            lastDeclinedState.store((static_cast<std::uint64_t>(block->armed.load()) << 32) | (static_cast<std::uint64_t>(memory.Protect & 0xffff) << 16) | (block->viewed.load() & 0xffff), std::memory_order_relaxed);
+        *protection = queried ? memory.Protect : 0;
+        type = queried ? memory.Type : 0;
+        return queried && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+    };
+    const auto start = nowNs();
+    DWORD protection = 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (armed()) {
+            const bool own = block->lock.load(std::memory_order_acquire) == threadToken();
+            if (!own) lockBlock(*block);
+            const bool still = armed();
+            if (still) disarmLocked(blockBase, *block);
+            if (!own) unlockBlock(*block);
+            if (!still) continue;
+            counters.faults.fetch_add(1, std::memory_order_relaxed);
+            counters.faultNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+            return true;
+        }
+        if (writable(&protection)) {
+            if (block->opened.load(std::memory_order_relaxed) != 0) counters.lateFaults.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (!armed()) {
+            if (writable(&protection)) {
+                counters.lateFaults.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            if (!armed()) break;
         }
     }
-    if (!own) unlockBlock(*block);
-    counters.faultNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
-    return served;
+    thread_local std::uintptr_t retriedAddress = 0;
+    thread_local unsigned retries = 0;
+    if (tracked(*block) != 0 || block->opened.load(std::memory_order_relaxed) != 0) {
+        if (retriedAddress != address) {
+            retriedAddress = address;
+            retries = 0;
+        }
+        if (type == MEM_PRIVATE && ++retries <= 64) {
+            counters.retriedFaults.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        retries = 0;
+        counters.declined.fetch_add(1, std::memory_order_relaxed);
+        lastDeclined.store(address, std::memory_order_relaxed);
+        lastDeclinedState.store((static_cast<std::uint64_t>(block->armed.load()) << 32) | (static_cast<std::uint64_t>(protection & 0xffff) << 16) | (block->viewed.load() & 0xffff), std::memory_order_relaxed);
+    }
+    return false;
 #else
     static_cast<void>(address);
     return false;
@@ -580,6 +642,9 @@ void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* out) {
     out->renewRefused = take(counters.renewRefused);
     out->lateFaults = take(counters.lateFaults);
     out->declined = take(counters.declined);
+    out->retriedFaults = take(counters.retriedFaults);
+    out->armWaits = take(counters.armWaits);
+    out->armWaitNs = take(counters.armWaitNs);
     out->lastDeclined = lastDeclined.load(std::memory_order_relaxed);
     out->lastDeclinedState = lastDeclinedState.load(std::memory_order_relaxed);
     for (std::size_t k = 0; k < 4; ++k) {

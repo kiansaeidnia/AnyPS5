@@ -1,3 +1,6 @@
+#include "prx/libSceAgcDriver/Graphics/include/PrepareShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
@@ -163,7 +166,7 @@ struct CachedTexture {
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
 // still kept), the linear lookup of before.
 struct TextureCache {
-    AgcDriver::Mutex mutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::Texture> mutex;
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
@@ -311,7 +314,7 @@ struct SampledCacheLock {
     }
     SampledCacheLock(const SampledCacheLock&) = delete;
     SampledCacheLock& operator=(const SampledCacheLock&) = delete;
-    std::unique_lock<AgcDriver::Mutex> lock;
+    std::unique_lock<decltype(TextureCache::mutex)> lock;
     bool owner = false;
 };
 
@@ -355,6 +358,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 }
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     cache.bytes -= it->accounted;
     if (it->source == nullptr) {
         cache.snapshotBytes -= it->accounted;
@@ -2188,7 +2192,7 @@ struct CachedStorageTexture {
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
 struct StorageTextureCache {
-    AgcDriver::Mutex mutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::Storage> mutex;
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
@@ -2228,6 +2232,7 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
@@ -5209,11 +5214,293 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+namespace {
+// Lever A census (APS5_V3E_A_CENSUS=1, log-only): for proofs the epoch memo does not serve, would a memo keyed on the
+// per-cause serial (ProofSerialCaused: ProofSerial without foreign GPU-mutex acquires) and the pending serial have held,
+// and did the full proof then pass by the fast path (stamps; no full walk)? That upper-bounds lever A's hit rate (memory
+// content is assumed proven by tokens wherever the stamp proof passed). Split by sets of one shader (dispatches) and more
+// (draws); [a-census] every 10 s.
+bool aCensus() {
+    static const bool enabled = std::getenv("APS5_V3E_A_CENSUS") != nullptr;
+    return enabled;
+}
+struct ACensus { std::array<std::atomic<std::uint64_t>, 2> proofs{}, served{}, keyHeld{}, heldFast{}, missFast{}; };
+ACensus aCounts;
+std::atomic<std::int64_t> aReportNs{0};
+void aReport() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = aReportNs.load(std::memory_order_relaxed);
+    if (last == 0) { aReportNs.store(now, std::memory_order_relaxed); return; }
+    if (now - last < 10'000'000'000LL || !aReportNs.compare_exchange_strong(last, now)) return;
+    for (std::size_t k = 0; k < 2; ++k) {
+        const auto proofs = aCounts.proofs[k].exchange(0), served = aCounts.served[k].exchange(0), held = aCounts.keyHeld[k].exchange(0), fast = aCounts.heldFast[k].exchange(0), missFast = aCounts.missFast[k].exchange(0);
+        AgcDriver::ProfilePrint_nid_no_patch("[a-census] 10 s %s: %llu proofs, %llu served by the epoch memo; of the rest, the per-cause key held for %llu, %llu of them then passed the fast proof (would be served by A: %.1f %% of the unserved); key moved but fast proof passed %llu\n", k == 0 ? "dispatch sets" : "draw sets", static_cast<unsigned long long>(proofs), static_cast<unsigned long long>(served), static_cast<unsigned long long>(held), static_cast<unsigned long long>(fast), proofs > served ? 100.0 * static_cast<double>(fast) / static_cast<double>(proofs - served) : 0.0, static_cast<unsigned long long>(missFast));
+    }
+}
+}
+
+namespace {
+struct DrawMemoCounts { std::atomic<std::uint64_t> proofs{0}, served{0}, verified{0}, keyMoved{0}, dirty{0}, cpuPending{0}, invalid{0}, unarmed{0}; };
+DrawMemoCounts drawMemo;
+std::atomic<std::int64_t> drawMemoReportNs{0};
+void reportDrawMemo() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = drawMemoReportNs.load(std::memory_order_relaxed);
+    if (last == 0) { drawMemoReportNs.store(now, std::memory_order_relaxed); return; }
+    if (now - last < 10'000'000'000LL || !drawMemoReportNs.compare_exchange_strong(last, now)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-memo] 10 s: %llu draw-set proofs, served %llu, verified %llu; not served: key moved %llu, ranges dirty %llu, CPU writes pending %llu, no valid memo %llu; memos left unarmed %llu\n",
+        static_cast<unsigned long long>(drawMemo.proofs.exchange(0)), static_cast<unsigned long long>(drawMemo.served.exchange(0)), static_cast<unsigned long long>(drawMemo.verified.exchange(0)), static_cast<unsigned long long>(drawMemo.keyMoved.exchange(0)), static_cast<unsigned long long>(drawMemo.dirty.exchange(0)), static_cast<unsigned long long>(drawMemo.cpuPending.exchange(0)), static_cast<unsigned long long>(drawMemo.invalid.exchange(0)), static_cast<unsigned long long>(drawMemo.unarmed.exchange(0)));
+}
+}
+
+bool ShaderResources::proveDrawMemo(std::span<const CompiledShader> shaders, ProofReport* report) {
+    static const bool verify = std::getenv("APS5_V3E_DRAW_PROOF_MEMO_VERIFY") != nullptr;
+    drawMemo.proofs.fetch_add(1, std::memory_order_relaxed);
+    const auto caused = GuestMemory::ProofSerialCaused();
+    const auto pending = StorageTexture::PendingSerial();
+    bool clean = false;
+    if (!memoValid || memoTokens.empty()) drawMemo.invalid.fetch_add(1, std::memory_order_relaxed);
+    else if (memoCaused != caused || memoPending != pending) drawMemo.keyMoved.fetch_add(1, std::memory_order_relaxed);
+    else if (!ImageFlags::CleanSinceAll(memoTokens)) drawMemo.dirty.fetch_add(1, std::memory_order_relaxed);
+    else if (std::any_of(memoTokens.begin(), memoTokens.end(), [&](const ImageFlags::DirtyQuery& range) { return PendingCpuWritesOverlap(context, range.address, range.bytes); })) drawMemo.cpuPending.fetch_add(1, std::memory_order_relaxed);
+    else clean = true;
+    if (clean && !verify) {
+        drawMemo.served.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& range : memoTokens) ImageFlags::NoteServed(range.address, range.bytes);
+        if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+        reportDrawMemo();
+        return true;
+    }
+    std::vector<ImageFlags::DirtyQuery> armed;
+    bool all = true;
+    if (!clean) {
+        const auto arm = [&](std::uint64_t address, std::uint64_t bytes) {
+            if (!all || bytes == 0) return;
+            const auto token = ImageFlags::Arm(address, static_cast<std::size_t>(bytes));
+            if (token == 0) all = false;
+            else armed.push_back({address, static_cast<std::size_t>(bytes), token});
+        };
+        for (const auto& region : directRegions) arm(region.begin, region.end - region.begin);
+        for (const auto& range : describedRanges) {
+            arm(range.address, range.bytes);
+            if (range.dccAddress != 0) arm(range.dccAddress, DccKeyBytes(range.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            arm(image->Descriptor().baseAddress, image->GuestBytes());
+            if (image->Descriptor().dccAddress != 0) arm(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        }
+        for (const auto& surface : validatedTextures) {
+            arm(surface.resource.baseAddress, surface.bytes);
+            if (surface.resource.dccAddress != 0) arm(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+        }
+    }
+    std::vector<std::uint64_t> versions;
+    if (clean) for (const auto& image : storageTextures) versions.push_back(image->Version());
+    const bool ok = revalidateFull(shaders, report);
+    if (clean) {
+        bool same = ok;
+        for (std::size_t i = 0; same && i < storageTextures.size(); ++i) same = storageTextures[i]->Version() == versions[i];
+        if (!same) throw std::runtime_error("AGC graphics: the draw proof memo served a set its full proof rejects or refreshes (APS5_V3E_DRAW_PROOF_MEMO_VERIFY)");
+        drawMemo.verified.fetch_add(1, std::memory_order_relaxed);
+        reportDrawMemo();
+        return ok;
+    }
+    if (ok && !all) drawMemo.unarmed.fetch_add(1, std::memory_order_relaxed);
+    memoValid = ok && all;
+    memoCaused = caused;
+    memoPending = pending;
+    memoTokens = std::move(armed);
+    reportDrawMemo();
+    return ok;
+}
+
+void ShaderResources::ForEachReadRange(const std::function<void(std::uint64_t, std::uint64_t)>& add) const {
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin);
+    for (const auto& range : describedRanges) {
+        add(range.address, range.bytes);
+        if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        add(image->Descriptor().baseAddress, image->GuestBytes());
+        if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
+    for (const auto& surface : validatedTextures) {
+        add(surface.resource.baseAddress, surface.bytes);
+        if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+    }
+}
+
+const char* ShaderResources::AheadName(Ahead result) {
+    static constexpr const char* names[] = {"pass", "not reusable", "address-based", "other", "audit", "depth", "DCC keys", "untracked", "evicted", "pending", "shadows", "imports", "changed"};
+    const auto index = static_cast<std::size_t>(result);
+    return index < std::size(names) ? names[index] : "?";
+}
+
+namespace {
+
+// The proof's pending-results and shadow checks (fastRevalidate's pending queries with their `except` images, then the
+// imported-region section), read-only: false when any foreign pending result or shadow overlaps.
+bool pendingAndShadowsClear(std::span<const ShaderResources::ProofView::Surface> surfaces, std::span<const std::shared_ptr<StorageTexture>> storage, std::span<const std::pair<std::uint64_t, std::uint64_t>> regions, bool& shadows) {
+    shadows = false;
+    thread_local std::vector<StorageTexture::PendingQuery>* pendingSlot = nullptr;
+    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    pending.clear();
+    for (const auto& surface : surfaces) pending.push_back({surface.address, surface.address + surface.bytes, surface.source, nullptr, false});
+    for (std::size_t i = 0; i < storage.size(); ++i) {
+        if (storage[i] == nullptr || (i != 0 && storage[i] == storage[i - 1])) continue;
+        const auto address = storage[i]->Descriptor().baseAddress;
+        pending.push_back({address, address + storage[i]->GuestBytes(), storage[i].get(), nullptr, false});
+    }
+    if (!pending.empty() && (!StorageTexture::ScanPending(pending) || std::any_of(pending.begin(), pending.end(), [](const auto& query) { return query.overlaps; }))) return false;
+    if (regions.empty()) return true;
+    pending.clear();
+    for (const auto& [begin, end] : regions) pending.push_back({begin, end, nullptr, nullptr, false});
+    StorageTexture::ScanPending(pending);
+    for (const auto& region : pending) {
+        if (region.overlaps) return false;
+        if (AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+            shadows = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+}
+
+void ShaderResources::PublishProofView() {
+    auto view = std::make_shared<ProofView>();
+    view->reusable = reusable;
+    view->addressBased = addressReuse || bdaTemplate;
+    view->holdsLease = HoldsLease();
+    view->context = &context;
+    view->surfaces = validatedTextures;
+    view->textures = textures;
+    view->storage = storageTextures;
+    view->storageKeys = storageKeys;
+    view->storageUntracked = storageUntracked;
+    for (const auto& region : directRegions) view->regions.emplace_back(region.begin, region.end);
+    for (const auto& [begin, end] : guestMemory.Writes()) view->regions.emplace_back(begin, end);
+    ForEachReadRange([&](std::uint64_t address, std::uint64_t bytes) { view->reads.emplace_back(address, bytes, bytes != 0 && CopiedWritesOverlap(address, static_cast<std::size_t>(bytes))); });
+    view->importsProof = importsProof;
+    proofView.store(std::shared_ptr<const ProofView>(std::move(view)), std::memory_order_release);
+}
+
+void ShaderResources::ForEachViewRange(const ProofView& view, const std::function<void(std::uint64_t, std::uint64_t, bool)>& add) {
+    for (const auto& [address, bytes, copied] : view.reads) add(address, bytes, copied);
+}
+
+bool ShaderResources::ViewHoldsLease(const ProofView& view) {
+    return view.holdsLease;
+}
+
+// The checks of revalidateFull's fast path (fastRevalidate under the epoch gate, then the imported-region section) over
+// a published view, without writes and without any cache lock: no FlushDepthPlanes / CompletePendingCpuWrites /
+// FlushPending, no own-object refresh, no key proofs (sets with DCC keys or depth surfaces are refused), no record
+// updates, no lookups. Pending results are always scanned. The audit clock is left to the commit, and so is an
+// untracked element's recorder-note stamp (it reads recorder state). Guest content read here is covered by the read set
+// the caller took from a stamp loaded before this call.
+ShaderResources::Ahead ShaderResources::ProveAhead(const ProofView& view) {
+    if (!view.reusable || view.context == nullptr) return Ahead::NotReusable;
+    if (view.addressBased) return Ahead::AddressBased;
+    static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
+    if (noFast || !EpochRevalidate() || GuestMemory::P0cNoProofs() || RuntimeSwitches::Set(RuntimeSwitch::V3eDrawProofMemo)) return Ahead::Other;
+    if (view.surfaces.size() != view.textures.size()) return Ahead::Other;
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    queries.clear();
+    const auto untrackedHolds = [](std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 4>& stamp) {
+        if (stamp[0] == 0 || GuestMemory::CollectEpoch() != stamp[0] || (GuestMemory::ForgetSerial() & 1u) != 0) return false;
+        return GuestMemory::NewestStamp(address, bytes) == stamp[1] && GuestMemory::ForgetStamp(address, bytes) == stamp[2];
+    };
+    for (std::size_t i = 0; i < view.textures.size(); ++i) {
+        const auto& surface = view.surfaces[i];
+        if (!surface.valid || view.textures[i] == nullptr) return Ahead::Other;
+        if (surface.depth) return Ahead::Depth;
+        if (view.textures[i]->Released()) return Ahead::Evicted;
+        const auto address = surface.resource.baseAddress;
+        const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (surface.resource.dccAddress != 0 || surface.keys != DccKeys::Uncompressed) return Ahead::Keys;
+        if (DepthPlanesStale(address, bytes)) return Ahead::Depth;
+        const auto* source = surface.source;
+        if (source != nullptr && source->Descriptor().dccAddress != 0) return Ahead::Keys;
+        if (source != nullptr && !source->Cached()) return Ahead::Evicted;
+        bool untracked = false, committed = false;
+        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            if (source == nullptr && surface.committed.has_value() && CommittedProofEnabled()) {
+                thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* runsSlot = nullptr;
+                auto& runs = ShaderRecompiler::ThreadOwned(runsSlot);
+                if (GuestMemory::CollectCommittedWrites(address, bytes, runs) == 0 || runs != *surface.committed || Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(runs, surface.generation)) return Ahead::Untracked;
+                committed = true;
+            } else {
+                if (!untrackedHolds(address, bytes, surface.untracked)) return Ahead::Untracked;
+                untracked = true;
+            }
+        }
+        if (source != nullptr) {
+            if (!untracked) queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
+        } else if (!committed && !untracked) {
+            queries.push_back({address, bytes, surface.generation});
+        }
+    }
+    for (std::size_t i = 0; i < view.storage.size(); ++i) {
+        const auto* image = view.storage[i].get();
+        if (image == nullptr) return Ahead::Other;
+        if (i >= view.storageKeys.size() || view.storageKeys[i] != 0 || image->Descriptor().dccAddress != 0) return Ahead::Keys;
+        if (i != 0 && view.storage[i] == view.storage[i - 1]) continue;
+        const auto address = image->Descriptor().baseAddress;
+        const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        if (DepthSurfaceAt(address) || DepthSurfaceOverlaps(view.context->device, address, bytes)) return Ahead::Depth;
+        if (!image->Cached()) return Ahead::Evicted;
+        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            if (i >= view.storageUntracked.size() || !untrackedHolds(address, bytes, view.storageUntracked[i])) return Ahead::Untracked;
+            continue;
+        }
+        queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
+    }
+    thread_local std::vector<ProofView::Surface>* surfacesSlot = nullptr;
+    auto& surfaces = ShaderRecompiler::ThreadOwned(surfacesSlot);
+    surfaces.clear();
+    for (const auto& surface : view.surfaces) surfaces.push_back({surface.resource.baseAddress, surface.bytes, surface.source});
+    bool shadows = false;
+    if (!pendingAndShadowsClear(surfaces, view.storage, view.regions, shadows)) return shadows ? Ahead::Shadows : Ahead::Pending;
+    if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return Ahead::Changed;
+    if (!HostImportsUnchanged(*view.context, view.importsProof)) return Ahead::Imports;
+    return Ahead::Pass;
+}
+
+bool ShaderResources::pendingClearNow() const {
+    thread_local std::vector<ProofView::Surface>* surfacesSlot = nullptr;
+    auto& surfaces = ShaderRecompiler::ThreadOwned(surfacesSlot);
+    surfaces.clear();
+    for (const auto& surface : validatedTextures) surfaces.push_back({surface.resource.baseAddress, surface.bytes, surface.source});
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* regionsSlot = nullptr;
+    auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
+    regions.clear();
+    for (const auto& region : directRegions) regions.emplace_back(region.begin, region.end);
+    for (const auto& [begin, end] : guestMemory.Writes()) regions.emplace_back(begin, end);
+    bool shadows = false;
+    return pendingAndShadowsClear(surfaces, storageTextures, regions, shadows);
+}
+
 bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
+    struct ShadowNote {
+        ShaderResources* self;
+        bool draws;
+        ~ShadowNote() {
+            if (!draws || !PrepareShadow::Active() || std::uncaught_exceptions() != 0) return;
+            PrepareShadow::NoteDrawSet(self, [this](const std::function<void(std::uint64_t, std::uint64_t)>& add) { self->ForEachReadRange(add); });
+        }
+    } shadowNote{this, shaders.size() > 1 && PrepareShadow::Enabled()};
+    if (shaders.size() > 1 && RuntimeSwitches::Set(RuntimeSwitch::V3eDrawProofMemo) && GuestMemory::DirtyEnabled()) return proveDrawMemo(shaders, report);
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
+        const bool census = aCensus();
+        const auto caused = census ? GuestMemory::ProofSerialCaused() : 0;
+        const std::size_t kind = shaders.size() == 1 ? 0 : 1;
+        if (census) aCounts.proofs[kind].fetch_add(1, std::memory_order_relaxed);
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
@@ -5225,29 +5512,103 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
             if (C3Log::Enabled()) C3Log::ThreadSplit().epochReused = true;
+            if (census) {
+                aCounts.served[kind].fetch_add(1, std::memory_order_relaxed);
+                aReport();
+            }
             return true;
         }
+        const bool keyHeld = census && provedEpoch != 0 && provedCaused == caused && provedPending == pending;
         if (C3Log::Enabled()) {
             auto& split = C3Log::ThreadSplit();
             split.epochMoved = epoch == 0 || provedEpoch != epoch;
             split.proofMoved = provedProof != proof;
             split.pendingMoved = provedPending != pending;
         }
-        const bool ok = revalidateFull(shaders, report);
+        ProofReport censusReport;
+        auto* used = report != nullptr ? report : census ? &censusReport : nullptr;
+        const bool ok = revalidateFull(shaders, used);
         noteEpochProof(false, false, false);
+        if (census) {
+            const bool fast = ok && used != nullptr && used->path == ProofPath::Fast;
+            if (keyHeld) aCounts.keyHeld[kind].fetch_add(1, std::memory_order_relaxed);
+            if (keyHeld && fast) aCounts.heldFast[kind].fetch_add(1, std::memory_order_relaxed);
+            if (!keyHeld && fast) aCounts.missFast[kind].fetch_add(1, std::memory_order_relaxed);
+            aReport();
+        }
         if (ok) {
             provedEpoch = epoch;
             provedProof = proof;
+            provedCaused = caused;
             provedPending = pending;
         } else {
             provedEpoch = 0;
         }
         return ok;
     }
-    return revalidateFull(shaders, report);
+    if (!aCensus()) return revalidateFull(shaders, report);
+    // Lever A census without the epoch memo (EpochProofs off in the game config): would the per-cause key have held?
+    const auto caused = GuestMemory::ProofSerialCaused();
+    const auto pending = StorageTexture::PendingSerial();
+    const std::size_t kind = shaders.size() == 1 ? 0 : 1;
+    aCounts.proofs[kind].fetch_add(1, std::memory_order_relaxed);
+    const bool keyHeld = provedEpoch != 0 && provedCaused == caused && provedPending == pending;
+    ProofReport censusReport;
+    auto* used = report != nullptr ? report : &censusReport;
+    const bool ok = revalidateFull(shaders, used);
+    const bool fast = ok && used->path == ProofPath::Fast;
+    if (keyHeld) aCounts.keyHeld[kind].fetch_add(1, std::memory_order_relaxed);
+    if (keyHeld && fast) aCounts.heldFast[kind].fetch_add(1, std::memory_order_relaxed);
+    if (!keyHeld && fast) aCounts.missFast[kind].fetch_add(1, std::memory_order_relaxed);
+    provedEpoch = ok ? 1 : 0;
+    provedCaused = caused;
+    provedPending = pending;
+    aReport();
+    return ok;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
+    bool served = false;
+    if (shaders.size() < 2 || !PrepareShadow::ProofOn()) {
+        if (shaders.size() < 2 || !PrepareShadow::PublishOnly()) return revalidateFullBody(shaders, report, false, false, served);
+        const bool ok = revalidateFullBody(shaders, report, false, false, served);
+        PublishProofView();
+        return ok;
+    }
+    // Whatever this proof leaves in the set is what the preparer reads next (ProofView).
+    struct Publish {
+        ShaderResources* self;
+        ~Publish() {
+            if (std::uncaught_exceptions() == 0 && (!PrepareShadow::NoPublish() || self->LoadProofView() == nullptr)) self->PublishProofView();
+        }
+    } publish{this};
+    const bool prepared = PrepareShadow::TakePrepared(this);
+    if (!prepared || !PrepareShadow::VerifyProof()) {
+        const bool ok = revalidateFullBody(shaders, report, prepared, false, served);
+        if (prepared) PrepareShadow::NoteServed(served);
+        return ok;
+    }
+    // APS5_V3E_PREPARE_PROOF_VERIFY=throw: today's proof runs anyway; where the prepared path would have served the
+    // set, today's must pass too without moving a storage image's content (a refresh or an upload).
+    std::vector<std::pair<const StorageTexture*, std::uint64_t>> versions;
+    for (const auto& surface : validatedTextures) {
+        if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+    }
+    for (const auto& image : storageTextures) {
+        if (image != nullptr) versions.emplace_back(image.get(), image->Version());
+    }
+    const bool ok = revalidateFullBody(shaders, report, true, true, served);
+    PrepareShadow::NoteServed(served);
+    if (served) {
+        const bool moved = std::any_of(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+        PrepareShadow::NoteVerify(ok && !moved);
+        if (!ok || moved) throw std::runtime_error(std::string("AGC graphics: a prepared draw-set proof served a set today's proof ") + (!ok ? "rejects" : "refreshes") + " (APS5_V3E_PREPARE_PROOF_VERIFY)");
+    }
+    return ok;
+}
+
+bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders, ProofReport* report, bool prepared, bool verify, bool& served) {
+    served = false;
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return false;
@@ -5267,18 +5628,19 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         C3Log::ThreadSplit().*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - c3Lap).count());
         c3Lap = now;
     };
+    bool prefixMoved = false;
     for (const auto& region : directRegions) {
-        static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
-        CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (!FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)).empty()) prefixMoved = true;
+        if (CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) prefixMoved = true;
     }
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+        if (CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes))) prefixMoved = true;
+        if (range.dccAddress != 0 && CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes))) prefixMoved = true;
     }
     for (const auto& image : storageTextures) {
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        if (CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()))) prefixMoved = true;
+        if (image->Descriptor().dccAddress != 0 && CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()))) prefixMoved = true;
     }
     c3Step(&C3Log::Split::completeNs);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
@@ -5291,6 +5653,64 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    // v3 lock split phase (ii): the preparer proved this set read-only (ProveAhead) and its read set validated with
+    // the storage-results and shadow registries unmoved (PrepareShadow::TakePrepared). What can move without a read-set
+    // entry is re-checked here under the record lock: syncs and depth-plane stores of this call, the audit clock,
+    // evictions and replacements, depth surfaces over storage images and the import table. Then the success tail of
+    // the proof below runs (staging copies, the texture touch, the pending memo, depth copies).
+    if (prepared) {
+        const auto commitServes = [&] {
+            if (prefixMoved || noFast || TemplateAuditDue(lastFullWalk) || validatedTextures.size() != textures.size()) return PrepareShadow::Fallback::Moved;
+            for (std::size_t i = 0; i < textures.size(); ++i) {
+                const auto& surface = validatedTextures[i];
+                if (!surface.valid || surface.depth || textures[i] == nullptr || textures[i]->Released()) return PrepareShadow::Fallback::Evicted;
+                if (surface.source != nullptr && !surface.source->Cached()) return PrepareShadow::Fallback::Evicted;
+                if (!FlushDepthPlanes(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)).empty()) return PrepareShadow::Fallback::Depth;
+                if (surface.untracked[0] != 0 && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0 && untrackedRangeStamp(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) != surface.untracked) return PrepareShadow::Fallback::Untracked;
+            }
+            thread_local std::vector<const StorageTexture*>* imagesSlot = nullptr;
+            auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
+            images.clear();
+            for (const auto& surface : validatedTextures) {
+                if (surface.source != nullptr) images.push_back(surface.source);
+            }
+            for (const auto& image : storageTextures) {
+                if (image == nullptr || !image->Cached()) return PrepareShadow::Fallback::Evicted;
+                if (DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) return PrepareShadow::Fallback::Depth;
+                images.push_back(image.get());
+            }
+            for (std::size_t i = 0; i < storageTextures.size() && i < storageUntracked.size(); ++i) {
+                const auto address = storageTextures[i]->Descriptor().baseAddress;
+                const auto bytes = static_cast<std::size_t>(storageTextures[i]->GuestBytes());
+                if (storageUntracked[i][0] != 0 && GuestMemory::CollectWrites(address, bytes) == 0 && untrackedRangeStamp(address, bytes) != storageUntracked[i]) return PrepareShadow::Fallback::Untracked;
+            }
+            if (PrepareShadow::RecheckPending() && !pendingClearNow()) return PrepareShadow::Fallback::Pending;
+            if (!StorageImagesCached(context, images)) return PrepareShadow::Fallback::Evicted;
+            if (!HostImportsUnchanged(context, importsProof)) return PrepareShadow::Fallback::Imports;
+            for (const auto* image : images) image->NoteProved();
+            return PrepareShadow::Fallback::None;
+        }();
+        PrepareShadow::NoteFallback(commitServes);
+        if (commitServes == PrepareShadow::Fallback::None && !verify) {
+            served = true;
+            if (report != nullptr) report->path = ProofPath::Fast;
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+                try {
+                    guestMemory.RecordStagingCopies(*recorder);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
+                    return finish(true, false);
+                }
+            }
+            if (!touchSampledTextures(textures)) return finish(true, false, ProofFailure::Evicted);
+            pendingSerialSeen = StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+            for (const auto& texture : textures) {
+                if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+            }
+            return finish(true, true);
+        }
+        if (commitServes == PrepareShadow::Fallback::None) served = true;
+    }
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -5877,6 +6297,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     std::lock_guard lock(mutex);
     if (object != nullptr) {
         const auto found = index.find(key);
@@ -5886,6 +6307,7 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
 }
 
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     std::lock_guard lock(mutex);
     removeImage(image, evicted);
 }

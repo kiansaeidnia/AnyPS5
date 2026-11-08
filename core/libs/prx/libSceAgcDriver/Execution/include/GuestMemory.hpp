@@ -157,6 +157,7 @@ OwnedBlockCounts TakeOwnedBlockCounts();
 // resources sharing pages see each other's writes. GPU writes into host-imported memory bypass the
 // page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
 // UnchangedSince is always false, so callers fall back to comparing bytes.
+void SetDriverWriteObserver(void (*observer)(std::uint64_t address, std::uint64_t bytes));
 bool DirtyEnabled();
 std::uint64_t DirtyArm(std::uint64_t address, std::size_t bytes);
 std::uint64_t DirtyArmAs(std::uint64_t address, std::size_t bytes, unsigned kind);
@@ -255,6 +256,9 @@ void EndCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
+// v3 exec lever A census (log-only): ProofSerial without the bumps a foreign GPU-mutex acquire makes by itself (every
+// other BreakProofs cause still bumps it).
+std::uint64_t ProofSerialCaused();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
@@ -313,6 +317,9 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+// The lock split's record lock (LockOrder.hpp) is today's GPU mutex under its new name.
+using RecordLock = GpuMutexType;
+inline RecordLock& Record() { return GpuMutex(); }
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
