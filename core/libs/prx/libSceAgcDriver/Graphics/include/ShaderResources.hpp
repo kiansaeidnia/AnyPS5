@@ -604,6 +604,10 @@ private:
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
         std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> entryCommitted;
+        // APS5_PREPARED_SNAPSHOTS: a cache miss's surface read and hashed in stage A into its upload's staging buffer,
+        // after the collect of `generation` (null: none).
+        std::shared_ptr<Buffer> prepared;
+        std::vector<ContentHash::Hash128> preparedHashes;
     };
     std::vector<ImageRecord> imageRecords;
     struct PreviousSampled {

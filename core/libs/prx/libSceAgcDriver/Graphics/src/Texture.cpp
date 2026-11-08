@@ -668,6 +668,8 @@ VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes) {
 }
 
 namespace {
+thread_local std::shared_ptr<Buffer> offeredStaging;
+
 VkMemoryPropertyFlags SnapshotStagingProperties(const Context& context, bool cached) {
     constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if (!cached) return coherent;
@@ -677,6 +679,15 @@ VkMemoryPropertyFlags SnapshotStagingProperties(const Context& context, bool cac
     }
     return coherent;
 }
+}
+
+std::shared_ptr<Buffer> Texture::SnapshotStaging(const Context& context, std::size_t bytes) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
+    return std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, true));
+}
+
+void Texture::OfferStaging(std::shared_ptr<Buffer> staging) {
+    offeredStaging = std::move(staging);
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory)
@@ -820,8 +831,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
             const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
-            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, cachedStaging));
-            fill(staging->Bytes().first(static_cast<std::size_t>(guestBytes)));
+            std::shared_ptr<Buffer> staging;
+            if (cachedStaging && offeredStaging != nullptr && offeredStaging->Bytes().size() == static_cast<std::size_t>(guestBytes)) {
+                staging = std::move(offeredStaging);
+            } else {
+                offeredStaging.reset();
+                staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, cachedStaging));
+                fill(staging->Bytes().first(static_cast<std::size_t>(guestBytes)));
+            }
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();

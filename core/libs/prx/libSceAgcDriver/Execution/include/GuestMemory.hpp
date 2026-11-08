@@ -69,6 +69,9 @@ void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::
 // ReadCommitted into `destination`, hashing the bytes it read per hash block (as HashBlocksOf would) right after
 // copying each block, while the block is still in the CPU cache.
 void ReadCommittedHashed(std::uint64_t address, std::span<std::byte> destination, std::span<ContentHash::Hash128> out);
+// As ReadCommittedHashed without the flush of pending GPU writes, for a reader without the device lock that
+// checked none is recorded over the range and validates the bytes against write stamps before using them.
+void ReadCommittedHashedUnflushed(std::uint64_t address, std::span<std::byte> destination, std::span<ContentHash::Hash128> out);
 // Whether every block of the range still hashes to `expected` (stops at the first differing block).
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected);
 struct BlockMatch {

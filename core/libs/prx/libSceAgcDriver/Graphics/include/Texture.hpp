@@ -96,6 +96,11 @@ public:
     // The snapshot's `snapshotBytes` bytes are written by `fill` straight into the upload's staging buffer, which is
     // host-cached memory when `cachedStaging` is set and the device has such a type (`fill` may read them back).
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::size_t snapshotBytes, const std::function<void(std::span<std::byte>)>& fill, bool depthCompare = false, bool hostMemory = false, bool cachedStaging = false);
+    // A host-cached staging buffer like the one the constructor above fills (APS5_PREPARED_SNAPSHOTS), and the hand-off:
+    // the next such construction on this thread with the same size takes the offered buffer as its staging and does
+    // not call `fill` (the caller holds the bytes' hashes). OfferStaging(nullptr) withdraws an unused offer.
+    static std::shared_ptr<Buffer> SnapshotStaging(const Context& context, std::size_t bytes);
+    static void OfferStaging(std::shared_ptr<Buffer> staging);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.

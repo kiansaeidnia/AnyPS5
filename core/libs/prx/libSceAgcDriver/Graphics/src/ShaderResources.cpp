@@ -502,6 +502,17 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
 // the new one would pass the share, evicts the entries no holder or recorded batch uses, least
 // recently used first. False when that is not enough (what is left is in use): the snapshot then
 // goes to system memory rather than past the share where it can (APS5_NO_TEXTURE_SPILL=1 keeps it device-local).
+// APS5_PREPARED_SNAPSHOTS: the stage-A snapshot of the element resolveImageBinding is resolving on this thread.
+struct PreparedSnapshot {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t generation = 0;
+    std::shared_ptr<Buffer>* buffer = nullptr;
+    const std::vector<ContentHash::Hash128>* hashes = nullptr;
+};
+thread_local const PreparedSnapshot* preparedSnapshot = nullptr;
+std::atomic<std::uint64_t> preparedMade{0}, preparedUsed{0}, preparedStale{0}, preparedUnused{0}, preparedBytes{0};
+
 bool makeRoom(TextureCache& cache, std::uint64_t incoming, const TextureCacheBudgets& budgets) {
     const auto all = SampledTextureMemory();
     const auto live = all - std::min(all, SampledTextureOverflowMemory());
@@ -653,6 +664,7 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     const auto sampled = SampledTextureMemory();
     const auto outside = sampled - std::min(sampled, cache.snapshotBytes);
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu refused over the ceiling (%llu MiB), %llu evicted (%llu MiB), %llu in-use ones passed over, %llu found changed; %llu resource sets dropped with released textures, %llu not cached for binding one; %llu out-of-memory reclaims (%llu MiB); %llu snapshots placed in system memory past the share (%llu MiB), %llu one-off snapshots reused; %llu MiB in %zu entries, budget %llu MiB, ceiling %llu MiB; sampled images outside the cache %llu MiB (in recorded work and builds); storage budget %llu MiB, VRAM share of the texture caches %llu MiB; frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.refusedBytes >> 20u), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedBytes >> 20u), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(dropped - droppedBefore), static_cast<unsigned long long>(refusedSets - refusedSetsBefore), static_cast<unsigned long long>(reclaims - reclaimsBefore), static_cast<unsigned long long>((reclaimed - reclaimedBefore) >> 20u), static_cast<unsigned long long>(counts.spilled), static_cast<unsigned long long>(counts.spilledBytes >> 20u), static_cast<unsigned long long>(counts.oneOffReuses), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budgets.sampled >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    AgcDriver::ProfilePrint_nid_no_patch("[prepared-snapshot] (10 s): %llu read in stage A (%.0f MiB), %llu used by stage B, %llu stale at stage B, %llu not needed\n", static_cast<unsigned long long>(preparedMade.exchange(0, std::memory_order_relaxed)), preparedBytes.exchange(0, std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(preparedUsed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(preparedStale.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(preparedUnused.exchange(0, std::memory_order_relaxed)));
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu snapshots made of %zu distinct surfaces; %llu spilled snapshots reused, %llu kept ones dropped (%llu MiB), %llu batches waited for; overflow type %llu MiB of a %llu MiB budget, %llu MiB of it kept for reuse in %zu snapshots\n", static_cast<unsigned long long>(counts.made), cache.madeSurfaces.size(), static_cast<unsigned long long>(counts.spilledReuses), static_cast<unsigned long long>(counts.overflowDropped), static_cast<unsigned long long>(counts.overflowDroppedBytes >> 20u), static_cast<unsigned long long>(counts.overflowWaits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 20u), static_cast<unsigned long long>(budgets.overflow >> 20u), static_cast<unsigned long long>(cache.overflowKept >> 20u), cache.overflowLru.size());
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) evictions by path: admission %llu (%llu used this present or the last), share %llu (%llu), reclaim %llu (%llu); eviction frame %llu at present %llu\n", static_cast<unsigned long long>(counts.evictedBy[0]), static_cast<unsigned long long>(counts.evictedRecent[0]), static_cast<unsigned long long>(counts.evictedBy[1]), static_cast<unsigned long long>(counts.evictedRecent[1]), static_cast<unsigned long long>(counts.evictedBy[2]), static_cast<unsigned long long>(counts.evictedRecent[2]), static_cast<unsigned long long>(cache.frame), static_cast<unsigned long long>(Recorder::Presents()));
     cache.madeSurfaces.clear();
@@ -2056,6 +2068,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             }
         };
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
+        bool usePrepared = false;
+        if (const auto* prepared = preparedSnapshot; prepared != nullptr && prepared->address == address && prepared->bytes == bytes && *prepared->buffer != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoDirectSnapshotStaging)) {
+            usePrepared = *keys == DccKeys::Uncompressed && !pending && resource.dccAddress == 0 && !GuestMemory::GpuOwned(address, static_cast<std::size_t>(bytes)) && GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes)) != 0 && GuestMemory::UnchangedSince(address, static_cast<std::size_t>(bytes), prepared->generation) && !PendingStorageOverlaps(address, static_cast<std::size_t>(bytes), nullptr) && !Recorder::SnapshotWriteOverlaps(address, static_cast<std::size_t>(bytes));
+            (usePrepared ? preparedUsed : preparedStale).fetch_add(1, std::memory_order_relaxed);
+            if (usePrepared) {
+                entry.hashes = *prepared->hashes;
+                Texture::OfferStaging(std::move(*prepared->buffer));
+            } else {
+                prepared->buffer->reset();
+            }
+        }
         if (RuntimeSwitches::Set(RuntimeSwitch::NoDirectSnapshotStaging)) {
             const SnapshotBuffer snapshotBuffer(bytes);
             readSnapshot(snapshotBuffer.Bytes());
@@ -2063,6 +2086,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         } else {
             entry.texture = createTexture(*context.detiler, resource, components, static_cast<std::size_t>(bytes), std::function<void(std::span<std::byte>)>(readSnapshot), depthCompare, spill, true);
         }
+        if (usePrepared) Texture::OfferStaging(nullptr);
         ++cache.counts.made;
         ++cache.totals.made;
         cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
@@ -6492,6 +6516,22 @@ bool ShaderResources::precollectImages() {
                         counters.records.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
+                constexpr std::uint64_t PreparedMinimumBytes = 256 * 1024;
+                const auto address = record.resource.baseAddress;
+                const auto bytes = static_cast<std::size_t>(record.guestBytes);
+                if (record.sampled && record.texture == nullptr && record.words != std::array<std::uint32_t, 8>{} && RuntimeSwitches::Set(RuntimeSwitch::PreparedSnapshots) && record.keys == DccKeys::Uncompressed && record.resource.dccAddress == 0 && record.generation != 0 && record.guestBytes >= PreparedMinimumBytes && !GuestMemory::SpeculativeReader() && !Recorder::SnapshotWriteOverlaps(address, bytes) && !GuestMemory::GpuOwned(address, bytes)) {
+                    try {
+                        auto staging = Texture::SnapshotStaging(context, bytes);
+                        std::vector<ContentHash::Hash128> hashes(GuestMemory::HashBlockCount(address, bytes));
+                        GuestMemory::ReadCommittedHashedUnflushed(address, staging->Bytes(), hashes);
+                        record.prepared = std::move(staging);
+                        record.preparedHashes = std::move(hashes);
+                        preparedMade.fetch_add(1, std::memory_order_relaxed);
+                        preparedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    } catch (const std::exception&) {
+                        record.prepared.reset();
+                    }
+                }
             }
             imageRecords.push_back(std::move(record));
         }
@@ -6620,7 +6660,19 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 Require(!depthCompare && !DepthSurfaceAt(resource.baseAddress), "reading sample 0 of a multisampled depth surface through a 2D image is not implemented");
                 texture = MultisampleTargetFirstSample(context, resource, components);
             }
-            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType);
+            if (texture == nullptr) {
+                PreparedSnapshot prepared;
+                if (record != nullptr && record->prepared != nullptr && !depthCompare && !firstLayer) prepared = {record->resource.baseAddress, record->guestBytes, record->generation, const_cast<std::shared_ptr<Buffer>*>(&record->prepared), &record->preparedHashes};
+                struct Scope {
+                    explicit Scope(const PreparedSnapshot* snapshot) { preparedSnapshot = snapshot; }
+                    ~Scope() { preparedSnapshot = nullptr; }
+                } scope{prepared.buffer != nullptr ? &prepared : nullptr};
+                texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType);
+            }
+            if (record != nullptr && record->prepared != nullptr) {
+                const_cast<ImageRecord*>(record)->prepared.reset();
+                preparedUnused.fetch_add(1, std::memory_order_relaxed);
+            }
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
             bool baseLevel = false;
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
