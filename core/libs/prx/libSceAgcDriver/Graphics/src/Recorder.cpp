@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayMetrics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -2840,7 +2841,7 @@ bool Recorder::GpuTimingEnabled() {
 }
 
 bool Recorder::BatchStampsEnabled() {
-    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
+    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || ReplayMetrics::Enabled();
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
@@ -3708,6 +3709,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         if (batch.batchTiming == 0 && stamps[1] >= stamps[0]) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
+            ReplayMetrics::GpuRange(batch.gpuStartNs, batch.gpuEndNs);
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
         }
         return;
@@ -3724,6 +3726,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             // The whole batch: apart from the per-program totals it contains.
             batch.gpuStartNs = static_cast<double>(stamps[i * 2]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[i * 2 + 1]) * period;
+            ReplayMetrics::GpuRange(batch.gpuStartNs, batch.gpuEndNs);
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
             timingBatchMs += ns / 1e6;
             AgcDriver::PerformanceCounters::AddGpuNanoseconds(static_cast<std::uint64_t>(ns));

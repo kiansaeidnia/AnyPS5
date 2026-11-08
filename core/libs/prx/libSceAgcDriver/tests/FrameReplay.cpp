@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -132,6 +133,89 @@ bool equal(const std::byte* bytes, const std::vector<std::byte>& expected) {
     return std::memcmp(bytes, expected.data(), expected.size()) == 0;
 }
 
+double number(const std::string& line, const std::string& key) {
+    const auto field = "\"" + key + "\":";
+    const auto at = line.find(field);
+    check(at != std::string::npos, "benchmark output has no " + key + ": " + line);
+    std::size_t consumed = 0;
+    const auto value = std::stod(line.substr(at + field.size()), &consumed);
+    const auto end = at + field.size() + consumed;
+    check(end < line.size() && (line[end] == ',' || line[end] == '}'), "invalid benchmark number for " + key);
+    check(std::isfinite(value) && value >= 0.0, "invalid benchmark value for " + key);
+    return value;
+}
+
+void checkBenchmark(const std::filesystem::path& path, std::size_t expectedFrames) {
+    std::ifstream file(path);
+    check(file.is_open(), "cannot open benchmark output");
+    std::size_t frames = 0, summaries = 0;
+    double wallMs = 0.0;
+    for (std::string line; std::getline(file, line);) {
+        if (line.find("\"type\":\"replay_frame\"") != std::string::npos) {
+            check(number(line, "frame") == static_cast<double>(++frames), "benchmark frame indices are not sequential");
+            const auto wall = number(line, "wall_ms");
+            check(wall > 0.0, "benchmark frame has no wall time");
+            wallMs += wall;
+            for (const auto* metric : {"queue0_cpu_ms", "draw_committer_cpu_ms", "other_queues_wait_reg_mem_ms", "gpu_busy_ms", "gpu_batch_ms"}) number(line, metric);
+            check(line.find("\"wait_reg_mem_ms_by_queue\":{") != std::string::npos, "benchmark has no queue wait breakdown");
+            check(number(line, "gpu_busy_ms") <= number(line, "gpu_batch_ms") + 0.000001, "GPU busy union exceeds the batch sum");
+        } else if (line.find("\"type\":\"replay_bench_summary\"") != std::string::npos) {
+            ++summaries;
+            check(number(line, "frames") == static_cast<double>(expectedFrames), "benchmark summary has the wrong frame count");
+            check(line.find("\"valid\":true") != std::string::npos, "benchmark rejected the replay");
+            check(std::abs(number(line, "frame_mean_ms") * expectedFrames - wallMs) < 0.0001, "benchmark mean differs from its frame measurements");
+            check(number(line, "total_s") >= number(line, "prologue_s"), "benchmark total excludes its prologue");
+        }
+    }
+    check(frames == expectedFrames && summaries == 1, "benchmark did not emit one record per frame and one summary");
+}
+
+void testDisplayBoundaries(const std::filesystem::path& tool, const FrameCaptureReader& source, const std::filesystem::path& capture, const Layout& firstLayout,
+                           const Layout& secondLayout, const std::vector<std::byte>& first, const std::vector<std::byte>& second) {
+    const auto directory = capture / "display-boundaries";
+    AgcDriver::FrameCaptureWriter writer(directory);
+    for (const auto& chunk : source.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Range) writer.WriteRange(chunk.address, chunk.bytes, chunk.rangeKind, chunk.protection, chunk.access);
+        else if (chunk.kind == FrameMemoryKind::Snapshot) writer.WriteSnapshot(chunk.address, source.Read(chunk));
+        else if (chunk.kind == FrameMemoryKind::Delta) writer.WriteDelta(chunk.group, chunk.completed, chunk.address, source.Read(chunk));
+        else throw std::runtime_error("unexpected memory record in the copy capture");
+    }
+    std::uint64_t ordinal = 0;
+    std::size_t frames = 0;
+    for (auto call : source.Calls()) {
+        if (call.kind == FrameCallKind::Submit) {
+            AgcDriver::FrameCall suspend;
+            suspend.kind = FrameCallKind::Suspend;
+            suspend.ordinal = ++ordinal;
+            suspend.thread = call.thread;
+            writer.WriteCall(suspend);
+        }
+        call.ordinal = ++ordinal;
+        writer.WriteCall(call);
+        if (call.kind != FrameCallKind::Flip) continue;
+        AgcDriver::FrameCall display;
+        display.kind = FrameCallKind::DisplayBuffer;
+        display.ordinal = ++ordinal;
+        display.thread = call.thread;
+        display.address = at(frames == 0 ? firstLayout.firstTarget : secondLayout.firstTarget);
+        display.values = {frames, 0x8000000000000000ull, 32, 32, 1, 32, 0, 0, 0, frames + 1, frames + 1};
+        writer.WriteReference(frames, display.address, frames == 0 ? first : second);
+        writer.WriteCall(display);
+        ++frames;
+    }
+    check(frames == 2, "display boundary fixture needs two frames");
+    writer.Finish(source.Header());
+    const auto firstDump = directory / "first.bin";
+    const auto secondDump = directory / "second.bin";
+    const auto log = directory / "benchmark.jsonl";
+    const auto command = "\"\"" + tool.string() + "\" \"" + directory.string() + "\" --bench --frame-limit 1 --dump " + std::to_string(at(firstLayout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + firstDump.string() +
+                         "\" --dump " + std::to_string(at(secondLayout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\" > \"" + log.string() + "\"\"";
+    check(std::system(command.c_str()) == 0, "benchmark with per-frame display records failed");
+    check(readFile(firstDump) == first, "benchmark ended before the first frame's copy");
+    check(readFile(secondDump) == std::vector<std::byte>(DataBytes), "benchmark included work beyond the first display boundary");
+    checkBenchmark(log, 1);
+}
+
 void testCaptureAndReplay(const std::filesystem::path& tool) {
     const char* directory = std::getenv("APS5_FRAME_CAPTURE");
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
@@ -186,12 +270,15 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
 
     const auto firstDump = capture / "first.bin";
     const auto secondDump = capture / "second.bin";
-    const auto command = "\"\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --dump " + std::to_string(at(layout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + firstDump.string() +
-                         "\" --dump " + std::to_string(at(late.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\"\"";
+    const auto log = capture / "benchmark.jsonl";
+    const auto command = "\"\"" + tool.string() + "\" \"" + capture.string() + "\" --bench --dump " + std::to_string(at(layout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + firstDump.string() +
+                         "\" --dump " + std::to_string(at(late.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\" > \"" + log.string() + "\"\"";
     const auto code = std::system(command.c_str());
     check(code == 0, "agc_frame_replay exited with " + std::to_string(code));
     check(readFile(firstDump) == first, "the replay did not reproduce the first copy");
     check(readFile(secondDump) == second, "the replay did not reproduce the second copy");
+    checkBenchmark(log, 2);
+    testDisplayBoundaries(tool, reader, capture, layout, late, first, second);
 }
 
 void testConcurrentCopies(const std::filesystem::path& tool) {

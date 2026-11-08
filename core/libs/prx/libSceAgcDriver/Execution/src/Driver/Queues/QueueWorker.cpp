@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayMetrics.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -146,6 +147,7 @@ void Driver::run(std::uint32_t id) noexcept {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);
     try {
+        ReplayThreadMetrics replayMetrics(ReplayThreadRole::QueueZero, id == 0);
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
         for (;;) {
             submission = Submission{};

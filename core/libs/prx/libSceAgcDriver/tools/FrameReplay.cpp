@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayMetrics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -65,6 +66,7 @@ struct Options {
     bool pace = true;
     bool strict = false;
     bool exact = false;
+    bool bench = false;
     std::size_t frameLimit = 0;
     std::filesystem::path checkpointReport;
     std::chrono::milliseconds paceTimeout{10000};
@@ -523,6 +525,7 @@ struct Replay {
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::size_t> sequenced{0};
     std::atomic<int> busy{0};
+    std::atomic<std::size_t> executingCalls{0};
     std::atomic<std::uint64_t> parkedReleases{0};
     std::atomic<std::uint64_t> fallbackReleases{0};
     std::atomic<bool> parkedWithoutRelease{false};
@@ -539,8 +542,16 @@ struct Replay {
     // breaker) must not count that time as no progress and release awaited dwords early.
     std::atomic<bool> closingWindows{false};
     std::size_t bindlessPrimed = 0;
+    AgcDriver::ReplayMetricsSnapshot benchmarkPrevious{};
+    Clock::time_point benchmarkFrameStart{};
+    std::vector<double> benchmarkFrameMs;
     std::vector<std::uint64_t> deferredBindless;
     bool bindlessWritten = false;
+
+    bool frameBoundary(const FrameCall& call) const {
+        if (options.bench && boundary == FrameCallKind::DisplayBuffer) return call.kind == boundary && call.values.size() >= 11;
+        return call.kind == boundary;
+    }
 
     void primeBindless(std::span<const std::uint64_t> words) {
         if (!options.bindlessPrime || words.empty()) return;
@@ -748,7 +759,9 @@ struct Replay {
         }
         case FrameCallKind::FrameStart:
         case FrameCallKind::End:
+            return;
         case FrameCallKind::DisplayBuffer:
+            if (closeFrames && frameBoundary(call)) closeFrame();
             return;
         }
         throw std::runtime_error("frame replay: unknown call kind");
@@ -764,6 +777,12 @@ struct Replay {
             ~Closed() { flag.store(false); }
         } closed{closingWindows};
         const auto deadline = Clock::now() + std::chrono::seconds(10);
+        if (options.bench) {
+            while (executingCalls.load() > 1) {
+                if (Clock::now() >= deadline) throw std::runtime_error("frame replay: earlier calls did not finish before the benchmark frame boundary");
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
         auto quietSince = Clock::now();
         auto lastCompleted = progress().second;
         bool drained = false;
@@ -783,9 +802,36 @@ struct Replay {
         }
         if (drained) AgcDriverWaitIdle_nid_postfix();
         else ++undrainedWindows;
+        if (options.bench && !drained) throw std::runtime_error("frame replay: benchmark frame boundary has unfinished submissions");
         const auto label = "frame-" + std::to_string(++framesClosed);
+        if (options.bench) benchmarkFrame();
         AgcDriver::ProfileWindows::Close(label.c_str());
         if (framesClosed.load() == 1) writeBindless();
+        if (options.bench) benchmarkFrameStart = Clock::now();
+    }
+
+    void benchmarkFrame() {
+        const auto now = Clock::now();
+        const auto metrics = AgcDriverReplayMetricsSnapshot_nid_no_patch();
+        const auto wallMs = std::chrono::duration<double, std::milli>(now - benchmarkFrameStart).count();
+        benchmarkFrameMs.push_back(wallMs);
+        std::string waits;
+        std::uint64_t otherWaitNs = 0;
+        for (const auto& queue : metrics.queues) {
+            const auto previous = std::find_if(benchmarkPrevious.queues.begin(), benchmarkPrevious.queues.end(), [&](const auto& value) { return value.queue == queue.queue; });
+            const auto ns = queue.waitRegMemNs - (previous == benchmarkPrevious.queues.end() ? 0 : previous->waitRegMemNs);
+            if (queue.queue == 0) continue;
+            otherWaitNs += ns;
+            waits += (waits.empty() ? "" : ",") + std::string("\"") + std::to_string(queue.queue) + "\":" + std::to_string(static_cast<double>(ns) / 1e6);
+        }
+        std::printf("{\"type\":\"replay_frame\",\"frame\":%zu,\"wall_ms\":%.6f,\"queue0_cpu_ms\":%.6f,\"draw_committer_cpu_ms\":%.6f,\"other_queues_wait_reg_mem_ms\":%.6f,\"wait_reg_mem_ms_by_queue\":{%s},\"gpu_busy_ms\":%.6f,\"gpu_batch_ms\":%.6f}\n",
+                    framesClosed.load(), wallMs, static_cast<double>(metrics.queue0CpuNs - benchmarkPrevious.queue0CpuNs) / 1e6,
+                    static_cast<double>(metrics.drawCommitterCpuNs - benchmarkPrevious.drawCommitterCpuNs) / 1e6,
+                    static_cast<double>(otherWaitNs) / 1e6, waits.c_str(), static_cast<double>(metrics.gpuBusyNs - benchmarkPrevious.gpuBusyNs) / 1e6,
+                    static_cast<double>(metrics.gpuBatchNs - benchmarkPrevious.gpuBatchNs) / 1e6);
+        std::fflush(stdout);
+        benchmarkPrevious = metrics;
+        benchmarkFrameStart = now;
     }
 
     static std::uint64_t load(std::uint64_t address, std::size_t bytes) {
@@ -977,7 +1023,12 @@ struct Replay {
                     const auto kind = calls[index].kind;
                     // A frame's closing call too when frame windows are on: the next frame's calls
                     // start after its windows closed.
-                    const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput || (closeFrames && kind == boundary);
+                    const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput || (closeFrames && frameBoundary(calls[index]));
+                    ++executingCalls;
+                    struct Executing {
+                        std::atomic<std::size_t>& count;
+                        ~Executing() { --count; }
+                    } executing{executingCalls};
                     if (!ordered) advance();
                     struct Running {
                         std::atomic<int>& busy;
@@ -1009,7 +1060,7 @@ struct Replay {
         auto lastCompleted = progress().second;
         auto lastReleases = earlyReleases.load();
         auto lastProgress = Clock::now();
-        const auto timeout = options.exact ? std::max<std::chrono::milliseconds>(options.drainTimeout, std::chrono::seconds(60)) : options.drainTimeout;
+        const auto timeout = options.exact ? std::chrono::duration_cast<std::chrono::milliseconds>(options.timeout) : options.drainTimeout;
         while (true) {
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
@@ -1022,7 +1073,7 @@ struct Replay {
                 std::fprintf(stderr, "[frame-replay] %llu submissions stay parked on waits nothing in the window releases (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
                 return;
-            } else if (Clock::now() - lastProgress >= timeout) {
+            } else if (timeout.count() > 0 && Clock::now() - lastProgress >= timeout) {
                 std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
                 return;
@@ -1053,7 +1104,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>] [--wall-windows]\n"
-                         "                        [--no-bindless-prime] [--bindless-in <file>] [--bindless-out <file>] [--dedupe-prologue]\n"
+                         "                        [--no-bindless-prime] [--bindless-in <file>] [--bindless-out <file>] [--dedupe-prologue] [--bench]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
@@ -1263,19 +1314,22 @@ int run(const Options& options, const FrameCaptureReader& reader, Clock::time_po
     if (options.frameWindows) AgcDriver::ProfileWindows::Close("prologue");
     replay.recording = true;
     replay.startedAt = Clock::now();
+    if (options.bench) {
+        replay.benchmarkPrevious = AgcDriverReplayMetricsSnapshot_nid_no_patch();
+        replay.benchmarkFrameStart = replay.startedAt;
+    }
     if (frameStart != calls.end()) {
         auto window = std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1);
         replay.boundary = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; }) ? FrameCallKind::Flip : FrameCallKind::Suspend;
+        if (options.bench && std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::DisplayBuffer && call.values.size() >= 11; })) replay.boundary = FrameCallKind::DisplayBuffer;
         replay.closeFrames = options.frameWindows;
         if (!options.checkpointReport.empty()) {
             const auto cut = std::find_if(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Checkpoint; });
             if (cut == window.end()) throw std::runtime_error("frame replay: --checkpoint needs a capture made with APS5_FRAME_CAPTURE_CHECKPOINT");
             window = window.first(static_cast<std::size_t>(cut - window.begin()));
         } else if (options.frameLimit != 0) {
-            const bool cpuFlips = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; });
-            const auto boundary = cpuFlips ? FrameCallKind::Flip : FrameCallKind::Suspend;
             std::size_t boundaries = 0;
-            const auto cut = std::find_if(window.begin(), window.end(), [&](const FrameCall& call) { return call.kind == boundary && ++boundaries == options.frameLimit; });
+            const auto cut = std::find_if(window.begin(), window.end(), [&](const FrameCall& call) { return replay.frameBoundary(call) && ++boundaries == options.frameLimit; });
             if (cut != window.end()) window = window.first(static_cast<std::size_t>(cut - window.begin()) + 1);
         }
         replay.runWindow(window);
@@ -1312,6 +1366,7 @@ int run(const Options& options, const FrameCaptureReader& reader, Clock::time_po
     gap("no-reference-frames", check.compared == 0 && options.dumps.empty());
     gap("missing-reference-frames", check.missing != 0);
     gap("pixels-differ", check.compared != 0 && check.identical < 1.0);
+    gap("missing-benchmark-frames", options.bench && replay.framesClosed.load() != (options.frameLimit != 0 ? options.frameLimit : headerNumber(reader.Header(), "frames")));
     const auto ready = replay.frames.Times();
     std::vector<double> frameMs;
     for (std::size_t index = 1; index < ready.size(); ++index) frameMs.push_back(std::chrono::duration<double, std::milli>(ready[index] - ready[index - 1]).count());
@@ -1328,6 +1383,15 @@ int run(const Options& options, const FrameCaptureReader& reader, Clock::time_po
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), prologueSeconds, static_cast<unsigned long long>(prologueSkipped), replay.framesClosed.load(), replay.undrainedWindows.load(), replay.bindlessPrimed, gaps.c_str());
     std::fflush(stdout);
+    if (options.bench) {
+        double frameTotal = 0.0;
+        for (const auto value : replay.benchmarkFrameMs) frameTotal += value;
+        const auto totalSeconds = std::chrono::duration<double>(Clock::now() - loadStart).count();
+        std::printf("{\"type\":\"replay_bench_summary\",\"frames\":%zu,\"total_s\":%.6f,\"prologue_s\":%.6f,\"frame_mean_ms\":%.6f,\"valid\":%s,\"within_five_minutes\":%s}\n",
+                    replay.benchmarkFrameMs.size(), totalSeconds, prologueSeconds, replay.benchmarkFrameMs.empty() ? 0.0 : frameTotal / replay.benchmarkFrameMs.size(),
+                    gaps.empty() ? "true" : "false", totalSeconds < 300.0 ? "true" : "false");
+        std::fflush(stdout);
+    }
     if (options.strict && !gaps.empty()) {
         std::fprintf(stderr, "agc_frame_replay: --strict rejects this replay: %s\n", gaps.c_str());
         return 5;
@@ -1347,6 +1411,7 @@ int main(int argc, char** argv) {
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--exact") options.exact = true;
+        else if (argument == "--bench") options.bench = true;
         else if (argument == "--checkpoint" && index + 1 < argc) options.checkpointReport = argv[++index];
         else if (argument == "--frame-limit" && index + 1 < argc) options.frameLimit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
@@ -1365,6 +1430,16 @@ int main(int argc, char** argv) {
     if (options.hostRegions) return PrintHostRegions();
 #endif
     if (options.directory.empty()) return usage();
+    if (options.bench) {
+        if (!options.pace || !options.frameWindows || !options.checkpointReport.empty()) {
+            std::fprintf(stderr, "frame replay: --bench requires pacing, frame windows and a complete frame capture\n");
+            return 2;
+        }
+        options.strict = true;
+        options.release = false;
+        options.synthesize = false;
+        options.dedupePrologue = true;
+    }
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     if (std::getenv("APS5_PIPELINE_CACHE_LOAD") == nullptr) _putenv_s("APS5_PIPELINE_CACHE_LOAD", "1");
@@ -1375,6 +1450,7 @@ int main(int argc, char** argv) {
     int code = 2;
     try {
         const auto loadStart = Clock::now();
+        if (options.bench) AgcDriverReplayMetricsEnable_nid_no_patch();
         const FrameCaptureReader reader(options.directory);
         // A captured range on one of this process's host regions cannot be mapped: start again (a new process gets a
         // new random layout), at most 4 times. Before the watchdog, so a waiting parent is never killed by it.

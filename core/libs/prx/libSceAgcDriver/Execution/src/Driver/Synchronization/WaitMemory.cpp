@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayMetrics.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <mutex>
@@ -106,7 +107,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
 }
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
-
+    ReplayWaitMetrics replayMetrics(queue);
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
 

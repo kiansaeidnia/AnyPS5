@@ -362,6 +362,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostAllocator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ReplayMetrics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTraceThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
@@ -732,6 +733,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_stack_walk PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_stack_walk PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_replay_metrics_tests tests/ReplayMetrics.cpp Execution/src/ReplayMetrics.cpp)
+    target_include_directories(agc_replay_metrics_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_replay_metrics_tests PRIVATE libc)
+    configure_windows_unwind(agc_replay_metrics_tests)
+    add_test(NAME agc_replay_metrics COMMAND agc_replay_metrics_tests)
+    set_tests_properties(agc_replay_metrics PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_replay_metrics PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
