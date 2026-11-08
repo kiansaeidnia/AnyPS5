@@ -469,7 +469,8 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     while (!cache.entries.empty() && cache.bytes + incoming > budget) {
         const auto back = std::prev(cache.entries.end());
         const bool over = cache.bytes + incoming > ceiling;
-        if (laterUses ? scan && !over && (firstUse ? back->present + 1u >= present : back->present == present) : firstUse && back->present + 1u >= present) {
+        const bool stable = RuntimeSwitches::Set(RuntimeSwitch::StableSampledSet);
+        if (stable ? scan && back->present + 1u >= present : laterUses ? scan && !over && (firstUse ? back->present + 1u >= present : back->present == present) : firstUse && back->present + 1u >= present) {
             cache.firstUses.insert(key);
             ++cache.counts.uncached;
             ++cache.totals.uncached;

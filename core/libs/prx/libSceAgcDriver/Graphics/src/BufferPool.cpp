@@ -458,7 +458,7 @@ std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags proper
     constexpr std::size_t smallest = 256;
     if (exactSizes()) return bytes;
     if (bytes < classLimit) return std::max(smallest, std::bit_ceil(bytes));
-    if (!DeviceTiered(properties)) return bytes;
+    if (!DeviceTiered(properties) && !RuntimeSwitches::Set(RuntimeSwitch::HostSizeClasses)) return bytes;
     const auto step = std::bit_floor(bytes) >> deviceClassBits;
     return (bytes + step - 1) / step * step;
 }

@@ -111,6 +111,8 @@ enum class RuntimeSwitch : std::size_t {
     NoFusedSnapshotHash,
     NoParallelBlockHash,
     NoDeferLaneEdge,
+    StableSampledSet,
+    HostSizeClasses,
     Count,
 };
 
