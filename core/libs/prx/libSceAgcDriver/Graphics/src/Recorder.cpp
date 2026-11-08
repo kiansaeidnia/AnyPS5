@@ -1523,6 +1523,14 @@ void Recorder::OrderAfterLane(int from) {
     switchEdge(from, to, true);
 }
 
+void Recorder::SplitAfterLane(int from) {
+    GuestMemory::AssertGpuLockHeld("Recorder::SplitAfterLane");
+    const int to = currentLane();
+    if (!AsyncLaneActive() || from == to) return;
+    switchEdge(from, to, false);
+    static_cast<void>(Commands());
+}
+
 void Recorder::CountTemplateEdge(bool beforeRefresh) {
     laneTemplateEdges[beforeRefresh ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 }

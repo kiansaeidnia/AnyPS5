@@ -321,6 +321,8 @@ public:
         std::uint64_t leaseSkipped = 0;
         std::uint64_t leaseSampled = 0;
         bool leaseGuardTripped = false;
+        // Deferred flushes over an async-lane writer that split the main lane's batch behind the async lane instead.
+        std::uint64_t laneEdges = 0;
     };
     static GpuOrderCounts GpuOrderTotals();
     // The reason of the write-back this thread is storing ("readback before label", "storage refresh", ...), or null.
