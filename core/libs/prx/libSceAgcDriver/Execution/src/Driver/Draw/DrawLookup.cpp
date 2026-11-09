@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -15,6 +16,34 @@ namespace {
 
 // APS5_RELOCATED_DATA_HITS counters (10 s, printed under APS5_PROFILE_WAITS or APS5_TRACE_DRAW_CACHE).
 std::atomic<std::uint64_t> refreshTries{0}, refreshHits{0}, relocateTries{0}, relocateEqual{0}, relocateData{0}, relocateDiffering{0}, relocateRefused{0};
+// Differing moved stages: whether the differing words lie in runs that moved with a pointer or in fixed runs, and how
+// many words differ (buckets 1, 2-4, 5-16, 17+).
+std::atomic<std::uint64_t> differMovedOnly{0}, differFixedOnly{0}, differBoth{0}, differUnreadable{0}, differMovedWords{0}, differFixedWords{0};
+std::array<std::atomic<std::uint64_t>, 4> differBuckets{};
+
+void classifyMovedDiffering(const DispatchVariant& variant, std::span<const std::pair<std::uint64_t, std::uint64_t>> runsAt) {
+    std::uint64_t moved = 0, fixed = 0;
+    std::size_t offset = 0;
+    std::vector<std::uint32_t> now;
+    for (std::size_t r = 0; r < runsAt.size(); ++r) {
+        const auto count = static_cast<std::size_t>((runsAt[r].second - runsAt[r].first) / sizeof(std::uint32_t));
+        now.assign(count, 0u);
+        if (GuestMemory::CopyMapped(runsAt[r].first, std::as_writable_bytes(std::span(now))) == GuestMemory::Compare::Unmapped) {
+            differUnreadable.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const bool movedRun = runsAt[r].first != variant.runs[r].first;
+        for (std::size_t k = 0; k < count && offset + k < variant.words.size(); ++k) {
+            if (now[k] != variant.words[offset + k]) ++(movedRun ? moved : fixed);
+        }
+        offset += count;
+    }
+    (moved != 0 && fixed != 0 ? differBoth : moved != 0 ? differMovedOnly : differFixedOnly).fetch_add(1, std::memory_order_relaxed);
+    differMovedWords.fetch_add(moved, std::memory_order_relaxed);
+    differFixedWords.fetch_add(fixed, std::memory_order_relaxed);
+    const auto total = moved + fixed;
+    differBuckets[total <= 1 ? 0 : total <= 4 ? 1 : total <= 16 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+}
 
 bool reportRelocatedHits() {
     static const bool report = std::getenv("APS5_PROFILE_WAITS") != nullptr || std::getenv("APS5_TRACE_DRAW_CACHE") != nullptr;
@@ -25,6 +54,8 @@ bool reportRelocatedHits() {
     if (now < due || !next.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count()) || due == 0) return false;
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[relocated-hits] (10 s) data refreshed at the same runs: %llu of %llu tried; moved runs: %llu tried, %llu equal, %llu with data refreshed, %llu differing, %llu not relocatable\n", take(refreshHits), take(refreshTries), take(relocateTries), take(relocateEqual), take(relocateData), take(relocateDiffering), take(relocateRefused));
+    AgcDriver::ProfilePrint_nid_no_patch("[relocated-differ] (10 s) moved stages that differ: only in moved runs %llu, only in fixed runs %llu, both %llu, unreadable %llu; differing words in moved runs %llu, in fixed runs %llu; per stage 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu
+", take(differMovedOnly), take(differFixedOnly), take(differBoth), take(differUnreadable), take(differMovedWords), take(differFixedWords), take(differBuckets[0]), take(differBuckets[1]), take(differBuckets[2]), take(differBuckets[3]));
     return true;
 }
 
@@ -347,6 +378,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, *runsAt);
                     if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
                         relocateDiffering.fetch_add(1, std::memory_order_relaxed);
+                        if (result == EntryOutcome::Differing) classifyMovedDiffering(*variant, *runsAt);
                         continue;
                     }
                     auto& hit = stageData[i];
