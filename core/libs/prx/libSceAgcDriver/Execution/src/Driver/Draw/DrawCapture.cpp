@@ -136,6 +136,7 @@ std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, co
     variant->forgetSerial = capture.forgetSerial;
     variant->pushOffset = capture.pushOffset;
     variant->userDataMask = capture.userDataMask;
+    variant->userData = program.userData;
     if (vertexInfo) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfo);
     std::vector<ShaderRecompiler::MemoryRegion> regions(capture.regions.begin(), capture.regions.end());
     for (const auto& read : decodeReads) regions.push_back({read.address, read.Bytes()});

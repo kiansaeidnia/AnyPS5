@@ -89,18 +89,20 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, std::span<const std::pair<std::uint64_t, std::uint64_t>> runsAt) {
     if (live != nullptr) live->clear();
+    const bool moved = !runsAt.empty();
+    const std::span<const std::pair<std::uint64_t, std::uint64_t>> baseRuns = moved ? runsAt : std::span<const std::pair<std::uint64_t, std::uint64_t>>(variant.runs);
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && pipeline.OverlapsAny(baseRuns)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
     vouched.clear();
-    if (!variant.shared.empty() && vouchedValidation() && !validateLegacy() && variant.runs.size() == regions.size()) VouchSharedRegions(variant.shared, regions.size(), &QueryPendingSpan, vouched);
+    if (!moved && !variant.shared.empty() && vouchedValidation() && !validateLegacy() && variant.runs.size() == regions.size()) VouchSharedRegions(variant.shared, regions.size(), &QueryPendingSpan, vouched);
     PendingView pending;
     pending.Load();
     std::erase_if(vouched, [&](const VouchedRegions& range) { return pending.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low)); });
@@ -114,10 +116,10 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
                 index = vouched[range++].end - 1u;
                 continue;
             }
-            checked.push_back(variant.runs[index]);
+            checked.push_back(baseRuns[index]);
         }
     }
-    const std::span<const std::pair<std::uint64_t, std::uint64_t>> runs = vouched.empty() ? std::span<const std::pair<std::uint64_t, std::uint64_t>>(variant.runs) : std::span<const std::pair<std::uint64_t, std::uint64_t>>(checked);
+    const std::span<const std::pair<std::uint64_t, std::uint64_t>> runs = vouched.empty() ? baseRuns : std::span<const std::pair<std::uint64_t, std::uint64_t>>(checked);
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling, vouched)) return EntryOutcome::Differing;
     auto publish = Graphics::Recorder::PublishGeneration();
     auto pendingSerial = Graphics::StorageTexture::PendingSerial();
@@ -133,7 +135,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         publish = Graphics::Recorder::PublishGeneration();
         pendingSerial = Graphics::StorageTexture::PendingSerial();
         forget = GuestMemory::ForgetSerial();
-        if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) return EntryOutcome::FlushingImage;
+        if (Graphics::StorageTexture::AnyPendingOverlaps(baseRuns) || Graphics::AnyShadowedOverlaps(baseRuns)) return EntryOutcome::FlushingImage;
     }
     if ((forget & 1) != 0) return EntryOutcome::ForgetMoved;
     for (const auto& label : deferredLabels().labels) {

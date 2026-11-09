@@ -1,10 +1,74 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// APS5_RELOCATED_DATA_HITS counters (10 s, printed under APS5_PROFILE_WAITS or APS5_TRACE_DRAW_CACHE).
+std::atomic<std::uint64_t> refreshTries{0}, refreshHits{0}, relocateTries{0}, relocateEqual{0}, relocateData{0}, relocateDiffering{0}, relocateRefused{0};
+
+bool reportRelocatedHits() {
+    static const bool report = std::getenv("APS5_PROFILE_WAITS") != nullptr || std::getenv("APS5_TRACE_DRAW_CACHE") != nullptr;
+    static std::atomic<std::int64_t> next{0};
+    if (!report) return false;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto due = next.load(std::memory_order_relaxed);
+    if (now < due || !next.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count()) || due == 0) return false;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[relocated-hits] (10 s) data refreshed at the same runs: %llu of %llu tried; moved runs: %llu tried, %llu equal, %llu with data refreshed, %llu differing, %llu not relocatable\n", take(refreshHits), take(refreshTries), take(relocateTries), take(relocateEqual), take(relocateData), take(relocateDiffering), take(relocateRefused));
+    return true;
+}
+
+// The variant's runs moved by its changed base pointers, when every used user word that differs from the ones its runs
+// were captured at is the base of one of its runs (tagVariantRuns), the stage binds no BDA page table, and no word past
+// the tracked 64 changed. Nullopt otherwise.
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> movedRuns(const DispatchVariant& variant, std::span<const std::uint32_t> now) {
+    if (variant.relocatableWords == 0 || variant.userData.size() != now.size() || variant.runBases.size() != variant.runs.size() || variant.compiled == nullptr) return std::nullopt;
+    if (std::any_of(variant.compiled->bindings.begin(), variant.compiled->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; })) return std::nullopt;
+    std::uint64_t changed = 0;
+    for (std::size_t w = 0; w < now.size(); ++w) {
+        if (now[w] == variant.userData[w]) continue;
+        if (w >= 64u) return std::nullopt;
+        if (((variant.userDataMask >> w) & 1u) != 0) changed |= std::uint64_t{1} << w;
+    }
+    if (changed == 0 || (changed & ~variant.relocatableWords) != 0) return std::nullopt;
+    std::uint64_t bases = 0;
+    for (const auto base : variant.runBases) {
+        if (base >= 0) bases |= std::uint64_t{1} << base;
+    }
+    if ((changed & ~bases) != 0) return std::nullopt;
+    auto runs = variant.runs;
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+        const auto base = variant.runBases[r];
+        if (base < 0 || ((changed >> base) & 1u) == 0) continue;
+        const auto delta = static_cast<std::int64_t>(now[static_cast<std::size_t>(base)] & ~std::uint32_t{3}) - static_cast<std::int64_t>(variant.userData[static_cast<std::size_t>(base)] & ~std::uint32_t{3});
+        runs[r].first = static_cast<std::uint64_t>(static_cast<std::int64_t>(runs[r].first) + delta);
+        runs[r].second = static_cast<std::uint64_t>(static_cast<std::int64_t>(runs[r].second) + delta);
+    }
+    return runs;
+}
+
+void regionsAt(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, const std::vector<std::uint32_t>& words, std::vector<ShaderRecompiler::MemoryRegion>& regions) {
+    regions.clear();
+    regions.reserve(runs.size());
+    std::size_t offset = 0;
+    for (const auto& [begin, end] : runs) {
+        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+        regions.push_back({begin, std::as_bytes(std::span<const std::uint32_t>(words).subspan(offset, count))});
+        offset += count;
+    }
+}
+
+}
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
     using Role = ShaderRecompiler::ProgramRole;
@@ -230,25 +294,77 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;
+            // APS5_RELOCATED_DATA_HITS (runtime switch): a stage whose captured data words changed is refreshed into its
+            // flat data binding (as a full hit's stage data), and a stage whose only changed used words are its
+            // relocatable base pointers is validated at its moved runs; one such stage per program (its words live in
+            // stageData[i]).
+            const bool relocate = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RelocatedDataHits) && drawStageDataHits();
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack || programs[i].userData.size() != dataEntry->decode->programs[i].userData.size()) continue;
                 const auto& now = programs[i].userData;
                 const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
+                bool patched = false;
                 for (const auto& variant : dataEntry->stages[i]) {
                     bool usedEqual = true;
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
                         if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
                     }
-                    if (!usedEqual) continue;
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                    if (usedEqual) {
+                        std::vector<ShaderRecompiler::MemoryRegion> regions;
+                        appendEntryRegions(*variant, regions);
+                        auto* live = relocate && !patched && !variant->dataPositions.empty() ? &liveData : nullptr;
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (live != nullptr) refreshTries.fetch_add(1, std::memory_order_relaxed);
+                        if (result == EntryOutcome::Equal) {
+                            candidates.emplace_back(variant, std::move(regions));
+                        } else if (result == EntryOutcome::EqualData && live != nullptr) {
+                            auto& hit = stageData[i];
+                            hit.words = variant->words;
+                            for (const auto& [position, value] : liveData) hit.words[position] = value;
+                            appendEntryRegions(*variant, regions = {}, &hit.words);
+                            hit.compiled = patchDataWords(*variant, hit.words);
+                            candidates.emplace_back(variant, std::move(regions));
+                            patched = true;
+                            refreshHits.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        continue;
+                    }
+                    if (!relocate || patched) continue;
+                    const auto runsAt = movedRuns(*variant, now);
+                    if (!runsAt) {
+                        if (variant->relocatableWords != 0) relocateRefused.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    relocateTries.fetch_add(1, std::memory_order_relaxed);
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
-                    appendEntryRegions(*variant, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
+                    regionsAt(*runsAt, variant->words, regions);
+                    auto* live = !variant->dataPositions.empty() ? &liveData : nullptr;
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, *runsAt);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, *runsAt);
+                    if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+                        relocateDiffering.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    auto& hit = stageData[i];
+                    hit.words = variant->words;
+                    if (result == EntryOutcome::EqualData) {
+                        for (const auto& [position, value] : liveData) hit.words[position] = value;
+                    }
+                    regionsAt(*runsAt, hit.words, regions);
+                    hit.compiled = result == EntryOutcome::EqualData ? patchDataWords(*variant, hit.words) : variant->compiled;
+                    candidates.emplace_back(variant, std::move(regions));
+                    patched = true;
+                    (result == EntryOutcome::EqualData ? relocateData : relocateEqual).fetch_add(1, std::memory_order_relaxed);
                 }
             }
+        }
+        if (reportRelocatedHits()) {
+            std::lock_guard cacheLock(drawCacheMutex);
+            reportDrawRelocation();
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }

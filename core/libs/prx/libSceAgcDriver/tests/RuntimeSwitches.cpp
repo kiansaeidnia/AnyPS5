@@ -44,6 +44,7 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_STABLE_SAMPLED_SET") == RuntimeSwitch::StableSampledSet, "the stable sampled set is not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_HOST_SIZE_CLASSES") == RuntimeSwitch::HostSizeClasses, "host buffer size classes are not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_PREPARED_SNAPSHOTS") == RuntimeSwitch::PreparedSnapshots, "prepared snapshots are not runtime switchable");
+    Require(RuntimeSwitches::Find("APS5_RELOCATED_DATA_HITS") == RuntimeSwitch::RelocatedDataHits, "relocated draw data hits are not runtime switchable");
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoDispatchOverlap), "a switch set in the environment did not start set");
     Require(!RuntimeSwitches::Set(RuntimeSwitch::NoBdaStaging), "a switch unset in the environment started set");
     Require(RuntimeSwitches::Find("APS5_NO_BDA_STAGING") == RuntimeSwitch::NoBdaStaging, "APS5_NO_BDA_STAGING is not a runtime switch");

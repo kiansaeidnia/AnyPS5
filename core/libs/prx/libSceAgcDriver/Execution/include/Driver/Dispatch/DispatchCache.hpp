@@ -46,6 +46,8 @@ struct DispatchVariant {
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    // Draw stages: the user words the runs were captured at (APS5_RELOCATED_DATA_HITS moves the runs based on them).
+    std::vector<std::uint32_t> userData;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;

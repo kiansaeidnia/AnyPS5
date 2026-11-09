@@ -112,6 +112,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_STABLE_SAMPLED_SET",
     "APS5_HOST_SIZE_CLASSES",
     "APS5_PREPARED_SNAPSHOTS",
+    "APS5_RELOCATED_DATA_HITS",
 };
 
 struct Refusal {
