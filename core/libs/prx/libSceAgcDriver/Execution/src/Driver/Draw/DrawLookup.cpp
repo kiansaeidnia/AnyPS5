@@ -54,8 +54,7 @@ bool reportRelocatedHits() {
     if (now < due || !next.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count()) || due == 0) return false;
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[relocated-hits] (10 s) data refreshed at the same runs: %llu of %llu tried; moved runs: %llu tried, %llu equal, %llu with data refreshed, %llu differing, %llu not relocatable\n", take(refreshHits), take(refreshTries), take(relocateTries), take(relocateEqual), take(relocateData), take(relocateDiffering), take(relocateRefused));
-    AgcDriver::ProfilePrint_nid_no_patch("[relocated-differ] (10 s) moved stages that differ: only in moved runs %llu, only in fixed runs %llu, both %llu, unreadable %llu; differing words in moved runs %llu, in fixed runs %llu; per stage 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu
-", take(differMovedOnly), take(differFixedOnly), take(differBoth), take(differUnreadable), take(differMovedWords), take(differFixedWords), take(differBuckets[0]), take(differBuckets[1]), take(differBuckets[2]), take(differBuckets[3]));
+    AgcDriver::ProfilePrint_nid_no_patch("[relocated-differ] (10 s) moved stages that differ: only in moved runs %llu, only in fixed runs %llu, both %llu, unreadable %llu; differing words in moved runs %llu, in fixed runs %llu; per stage 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu\n", take(differMovedOnly), take(differFixedOnly), take(differBoth), take(differUnreadable), take(differMovedWords), take(differFixedWords), take(differBuckets[0]), take(differBuckets[1]), take(differBuckets[2]), take(differBuckets[3]));
     return true;
 }
 
