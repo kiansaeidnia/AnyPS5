@@ -567,13 +567,13 @@ std::pair<std::uint32_t, std::uint32_t> ViewLevels(const GuestTextureResource& d
     return {base, last - base + 1u};
 }
 
-float ViewMinLod(const GuestTextureResource& descriptor, const VkImageSubresourceRange& range) {
+float TextureViewMinLod(const GuestTextureResource& descriptor, const VkImageSubresourceRange& range) {
     const auto clamp = EffectiveMinLod(descriptor);
     return clamp == 0.0f ? 0.0f : std::min(clamp, static_cast<float>(range.baseMipLevel + range.levelCount - 1u));
 }
 
 void ChainMinLod(const Context& context, const GuestTextureResource& descriptor, VkImageViewCreateInfo& viewInfo, VkImageViewMinLodCreateInfoEXT& minLod) {
-    const auto clamp = ViewMinLod(descriptor, viewInfo.subresourceRange);
+    const auto clamp = TextureViewMinLod(descriptor, viewInfo.subresourceRange);
     if (clamp == 0.0f) return;
     Require(context.imageViewMinLod, "guest texture descriptor uses a minimum LOD clamp, which needs VK_EXT_image_view_min_lod");
     minLod.minLod = clamp;
@@ -1026,17 +1026,17 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         viewFormat = viewInfo.format;
         viewInfo.components = depthCompare ? VkComponentMapping{} : components;
         viewInfo.subresourceRange = {aspect, viewBaseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        auto viewDescriptor = descriptor;
+        viewDescriptor.minLod -= std::min(viewDescriptor.minLod, skip * 256u);
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        ChainMinLod(context, descriptor, viewInfo, minLod);
-        if (skip != 0) minLod.minLod = std::max(0.0f, minLod.minLod - static_cast<float>(skip));
+        ChainMinLod(context, viewDescriptor, viewInfo, minLod);
         viewMinLod = viewInfo.pNext == &minLod ? minLod.minLod : 0.0f;
 
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
         viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
-        createFirstLayerView(descriptor, viewInfo);
-        prepareBaseLevelView(descriptor, viewInfo);
-        prepareSrgbView(descriptor, viewInfo);
-        if (skip != 0) srgbMinLod = std::max(0.0f, srgbMinLod - static_cast<float>(skip));
+        createFirstLayerView(viewDescriptor, viewInfo);
+        prepareBaseLevelView(viewDescriptor, viewInfo);
+        prepareSrgbView(viewDescriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
@@ -1655,7 +1655,7 @@ void Texture::prepareSrgbView(const GuestTextureResource& descriptor, VkImageVie
     viewInfo.pNext = nullptr;
     viewInfo.format = format;
     srgbInfo = viewInfo;
-    srgbMinLod = ViewMinLod(descriptor, viewInfo.subresourceRange);
+    srgbMinLod = TextureViewMinLod(descriptor, viewInfo.subresourceRange);
 }
 
 VkImageView Texture::SrgbView(bool firstLayer, bool baseLevel) const {

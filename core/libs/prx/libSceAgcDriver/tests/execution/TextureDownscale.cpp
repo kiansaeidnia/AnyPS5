@@ -346,20 +346,13 @@ std::array<std::uint32_t, Threads * Words> Sampled(AgcDriver::VulkanDevice& devi
     return Buffer;
 }
 
-bool SparseBc1(const AgcDriver::Graphics::Context& context) {
-    if (!context.sparseResidencyImage2D || context.sparseImageFormatProperties == nullptr) return false;
-    std::uint32_t count = 0;
-    context.sparseImageFormatProperties(context.physical, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_IMAGE_TYPE_2D, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_TILING_OPTIMAL, &count, nullptr);
-    return count != 0;
-}
-
 void Run(AgcDriver::VulkanDevice& device, const Context& context, std::uint32_t n) {
     GuestBlock whole(Mips(), BlockBytes(Mips()));
     FillLevels(whole.Texels(), 0);
     Sampled(device, whole.Texels(), n, 0u, "every level mapped");
     const auto clamped = Sampled(device, whole.Texels(), n, MinLodLevel, "every level mapped");
-    if (!context.imageViewMinLod || !SparseBc1(context)) {
-        std::puts("texture downscale: no sparse residency for 2D BC1 images or VK_EXT_image_view_min_lod, the unmapped-levels case is not run");
+    if (!context.imageViewMinLod) {
+        std::puts("texture downscale: no VK_EXT_image_view_min_lod, the unmapped-levels case is not run");
         return;
     }
     GuestBlock streamed(Mips(), ResidentBytes(Mips()));
