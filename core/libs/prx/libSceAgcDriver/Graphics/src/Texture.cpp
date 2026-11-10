@@ -672,6 +672,23 @@ static std::uint32_t DownscaleLevels(const GuestTextureResource& descriptor, boo
     return skip;
 }
 
+static void ProfileDownscaleUpload(std::uint64_t original, std::uint64_t kept) {
+    static const bool enabled = std::getenv("APS5_PROFILE_WAITS") != nullptr;
+    if (!enabled) return;
+    static std::mutex mutex;
+    static auto reported = std::chrono::steady_clock::now();
+    static std::uint64_t snapshots = 0, originalBytes = 0, keptBytes = 0;
+    std::lock_guard lock(mutex);
+    ++snapshots;
+    originalBytes += original;
+    keptBytes += kept;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    std::fprintf(stderr, "[downscale-upload] %llu snapshots: charged transfer buffers %.2f MiB, full-mip equivalent %.2f MiB; full guest-span hashes retained\n", static_cast<unsigned long long>(snapshots), static_cast<double>(keptBytes) / 1048576.0, static_cast<double>(originalBytes) / 1048576.0);
+    snapshots = originalBytes = keptBytes = 0;
+    reported = now;
+}
+
 std::uint64_t SampledTextureHostMemory() {
     return SampledHostMemoryCounter().load(std::memory_order_relaxed);
 }
@@ -750,13 +767,33 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         const auto sliceLinearBytes = geometry.sliceLinearBytes;
         Require(arrayLayers == 0 || sliceLinearBytes <= UINT64_MAX / arrayLayers, "detiled texture buffer size overflows");
-        const auto linearBytes = sliceLinearBytes * arrayLayers;
         const auto skip = srgbExpand || IsRepackedTextureFormat(descriptor.format) ? 0u : DownscaleLevels(descriptor, depthCompare);
         const auto imageLevels = geometry.imageLevels - skip;
+        std::vector<TileMipLayout> compactMips;
+        std::uint64_t uploadLayerBegin = 0;
+        auto uploadLayerBytes = geometry.layerBytes;
+        auto uploadSliceLinearBytes = sliceLinearBytes;
         if (skip != 0) {
+            compactMips.assign(mips.begin(), mips.begin() + geometry.imageLevels);
+            uploadLayerBegin = UINT64_MAX;
+            std::uint64_t tiledEnd = 0;
+            uploadSliceLinearBytes = 0;
+            for (std::uint32_t level = skip; level < compactMips.size(); ++level) {
+                auto& mip = compactMips[level];
+                uploadLayerBegin = std::min(uploadLayerBegin, mip.tiledOffset);
+                tiledEnd = std::max(tiledEnd, mip.tiledOffset + mip.tiledSize);
+                mip.linearOffset = uploadSliceLinearBytes;
+                uploadSliceLinearBytes += mip.linearSize;
+            }
+            Require(uploadLayerBegin < tiledEnd && tiledEnd <= geometry.layerBytes && uploadSliceLinearBytes <= sliceLinearBytes, "downscaled upload exceeds guest surface geometry");
+            uploadLayerBytes = tiledEnd - uploadLayerBegin;
+            for (std::uint32_t level = skip; level < compactMips.size(); ++level) compactMips[level].tiledOffset -= uploadLayerBegin;
             static std::atomic<std::uint64_t> downscaled{0};
             if (downscaled.fetch_add(1) == 0) std::fprintf(stderr, "[downscale] dropping %u top mip level(s) of large block-compressed textures (first: %ux%u -> %ux%u)\n", skip, descriptor.width, descriptor.height, descriptor.width >> skip, descriptor.height >> skip);
         }
+        const auto& uploadMips = skip != 0 ? compactMips : mips;
+        const auto uploadBytes = skip != 0 ? uploadLayerBytes * arrayLayers : guestBytes;
+        const auto linearBytes = uploadSliceLinearBytes * arrayLayers;
 
         const bool depth1D = depthCompare && (descriptor.dimension == TextureDimension::k1D || descriptor.dimension == TextureDimension::k1DArray);
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -869,7 +906,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, cachedStaging));
                 fill(staging->Bytes().first(static_cast<std::size_t>(guestBytes)));
             }
-            auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            if (skip != 0) {
+                auto compact = std::make_shared<Buffer>(context, static_cast<std::size_t>(uploadBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, false));
+                for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                    std::memcpy(compact->Bytes().data() + layer * uploadLayerBytes, staging->Bytes().data() + geometry.GuestLayerOffset(layer) + uploadLayerBegin, static_cast<std::size_t>(uploadLayerBytes));
+                }
+                staging = std::move(compact);
+            }
+            auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(uploadBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();
             if (profile) Profile().read += timer.lap();
@@ -887,8 +931,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
-                recorder->Keep(staging, static_cast<std::size_t>(guestBytes), Recorder::KeptKind::Upload);
-                recorder->Keep(tiled, static_cast<std::size_t>(guestBytes), Recorder::KeptKind::Upload);
+                recorder->Keep(staging, static_cast<std::size_t>(uploadBytes), Recorder::KeptKind::Upload);
+                recorder->Keep(tiled, static_cast<std::size_t>(uploadBytes), Recorder::KeptKind::Upload);
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes), Recorder::KeptKind::Upload);
                 recorder->Keep(owned);
                 if (uploadOwned != nullptr) recorder->Keep(uploadOwned);
@@ -898,15 +942,15 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
 
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, uploadBytes);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-                const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
-                const auto linearLayerOffset = geometry.LinearLayerOffset(layer);
-                for (std::uint32_t level = skip; level < mips.size(); ++level) {
+                const auto guestLayerOffset = skip != 0 ? layer * uploadLayerBytes : geometry.GuestLayerOffset(layer);
+                const auto linearLayerOffset = layer * uploadSliceLinearBytes;
+                for (std::uint32_t level = skip; level < uploadMips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
-                    const auto& mip = mips[level];
+                    const auto& mip = uploadMips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
                 }
             }
@@ -944,10 +988,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             std::vector<VkBufferImageCopy> regions;
             regions.reserve(static_cast<std::size_t>(arrayLayers) * mips.size());
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-                const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * sliceLinearBytes;
+                const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * uploadSliceLinearBytes;
                 for (std::uint32_t level = skip; level < geometry.imageLevels; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
-                    const auto& mip = mips[level];
+                    const auto& mip = uploadMips[level];
                     VkBufferImageCopy region{};
                     region.bufferOffset = linearLayerOffset + mip.linearOffset;
                     region.bufferRowLength = mip.pitchBytes / BytesPerElement(descriptor.format) * BlockWidth(descriptor.format);
@@ -975,7 +1019,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             if (dumpWanted) {
                 dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[skip].linearSize), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                CopyBuffer(context, commands, linear->Handle(), mips[skip].linearOffset, dump->Handle(), 0, mips[skip].linearSize);
+                CopyBuffer(context, commands, linear->Handle(), uploadMips[skip].linearOffset, dump->Handle(), 0, mips[skip].linearSize);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
             }
 
@@ -992,6 +1036,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;
+            if (skip != 0) ProfileDownscaleUpload(2 * guestBytes + sliceLinearBytes * arrayLayers, 2 * uploadBytes + linearBytes);
             if (profile) Profile().gpu += timer.lap();
             if (dump) {
                 static AgcDriver::Mutex dumpMutex;

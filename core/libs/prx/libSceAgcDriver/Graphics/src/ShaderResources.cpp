@@ -1805,7 +1805,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         reportSliceCopies(false);
     };
     const auto takeSlices = [&](Texture& texture) {
-        if (texture.CopyPendingSlices(slices)) {
+        const auto extent = texture.ImageExtent();
+        const bool originalExtent = extent.width == 0 || (extent.width == resource.width && extent.height == resource.height);
+        if (originalExtent && texture.CopyPendingSlices(slices)) {
             reportSliceCopies(true);
             return true;
         }

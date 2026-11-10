@@ -52,6 +52,8 @@ struct Shape {
     std::uint32_t maxMip;
     std::uint32_t lastLevel;
     std::uint32_t minLod = 0;
+    std::uint32_t tileMode = TileS64KB;
+    std::uint32_t layers = 1;
 };
 
 struct Expected {
@@ -65,8 +67,8 @@ std::array<std::uint32_t, 8> Descriptor(const Shape& shape) {
         static_cast<std::uint32_t>(Address >> 8u),
         static_cast<std::uint32_t>((Address >> 40u) & 0xffu) | (shape.minLod << 8u) | (shape.format << 20u) | (((shape.width - 1u) & 3u) << 30u),
         ((shape.width - 1u) >> 2u) | ((shape.height - 1u) << 14u),
-        0xfacu | (shape.lastLevel << 16u) | (TileS64KB << 20u) | (Type2D << 28u),
-        0u,
+        0xfacu | (shape.lastLevel << 16u) | (shape.tileMode << 20u) | ((shape.layers > 1u ? 13u : Type2D) << 28u),
+        shape.layers - 1u,
         shape.maxMip << 4u,
         0u,
         0u,
@@ -78,14 +80,20 @@ struct Made {
     VkExtent3D extent;
     VkDeviceSize bytes;
     float minLod;
+    std::size_t keptBytes;
+    std::size_t fullUploadBytes;
 };
 
 Made Make(const Context& context, TextureDetiler& detiler, const Shape& shape) {
     const auto words = Descriptor(shape);
     const auto descriptor = DecodeTextureResource(words);
-    const std::vector<std::byte> snapshot(static_cast<std::size_t>(DescribeSurface(descriptor).guestBytes));
+    const auto geometry = DescribeSurface(descriptor);
+    const std::vector<std::byte> snapshot(static_cast<std::size_t>(geometry.guestBytes));
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "texture downscale: no recorder for upload accounting");
+    recorder->Sync();
     Texture texture(context, detiler, descriptor, VkComponentMapping{}, snapshot);
-    return {texture.SampledViewRange(false).levels, texture.ImageExtent(), texture.AllocationBytes(), texture.ViewMinLod()};
+    return {texture.SampledViewRange(false).levels, texture.ImageExtent(), texture.AllocationBytes(), texture.ViewMinLod(), recorder->OpenKeptBytes(), static_cast<std::size_t>(2u * geometry.guestBytes + geometry.sliceLinearBytes * geometry.layers)};
 }
 
 std::string Text(const Shape& shape) {
@@ -105,13 +113,19 @@ void Run(const Context& context, TextureDetiler& detiler, std::uint32_t n) {
     const auto dropped = Check(context, detiler, n, {FormatBc1Unorm, 1024, 1024, 10, 10}, {11u - n, side, side});
     const auto reference = Check(context, detiler, n, {FormatBc1Unorm, side, side, 10u - n, 10u - n}, {11u - n, side, side});
     Require(dropped.bytes == reference.bytes, "APS5_TEXTURE_DOWNSCALE=" + std::to_string(n) + ": a downscaled 1024x1024 BC1 texture holds " + std::to_string(dropped.bytes) + " bytes, a " + std::to_string(side) + "x" + std::to_string(side) + " one below the minimum " + std::to_string(reference.bytes));
+    Require(dropped.keptBytes * 2u < dropped.fullUploadBytes, "downscaled tiled texture retained at least half its full-mip transfer buffers");
+    for (const auto tileMode : {0u, TileS64KB}) {
+        const auto array = Check(context, detiler, n, {FormatBc1Unorm, 2048, 1024, 11, 11, 0, tileMode, 3}, {12u - n, 2048u >> n, side});
+        Require(array.keptBytes * 2u < array.fullUploadBytes, "downscaled array retained at least half its full-mip transfer buffers");
+    }
 
     Check(context, detiler, n, {FormatBc1Unorm, 1024, 1024, 10, 1}, {1, 512, 512});
     Check(context, detiler, n, {FormatBc1Unorm, 1024, 8, 10, 10}, n == 1u ? Expected{10, 512, 4} : Expected{11, 1024, 8});
 
     Check(context, detiler, n, {FormatBc1Unorm, 1024, 1024, 0, 0}, {1, 1024, 1024});
     Check(context, detiler, n, {FormatBc1Unorm, 1024, 1024, 10, 0}, {1, 1024, 1024});
-    Check(context, detiler, n, {Format8888Unorm, 1024, 1024, 10, 10}, {11, 1024, 1024});
+    const auto unchanged = Check(context, detiler, n, {Format8888Unorm, 1024, 1024, 10, 10}, {11, 1024, 1024});
+    Require(unchanged.keptBytes == unchanged.fullUploadBytes, "texture downscaling changed uncompressed upload accounting");
 
     if (context.imageViewMinLod) {
         const auto clamped = Check(context, detiler, n, {FormatBc1Unorm, 1024, 1024, 10, 10, 10u * 256u}, {11u - n, side, side});
@@ -301,10 +315,11 @@ std::array<std::uint32_t, 4> SamplerDescriptor() {
     return {0u, 0xfffu << 12u, 1u << 26u, 0u};
 }
 
-void Dispatch(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uint32_t minLodLevel) {
+void Dispatch(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uint32_t minLodLevel, std::uint32_t tileMode = 0) {
     std::vector<std::uint32_t> userData(16, 0u);
     const auto buffer = BufferDescriptor(Buffer.data(), static_cast<std::uint32_t>(Buffer.size() * 4u));
-    const auto texture = TextureDescriptor(texels, minLodLevel);
+    auto texture = TextureDescriptor(texels, minLodLevel);
+    texture[3] |= tileMode << 20u;
     const auto sampler = SamplerDescriptor();
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
@@ -347,6 +362,18 @@ std::array<std::uint32_t, Threads * Words> Sampled(AgcDriver::VulkanDevice& devi
 }
 
 void Run(AgcDriver::VulkanDevice& device, const Context& context, std::uint32_t n) {
+    const auto tiledMips = ComputeMipLayout(TextureTileMode::kStandard64KB, FormatBc1Unorm, Size, Size, Levels);
+    GuestBlock tiled(tiledMips, BlockBytes(tiledMips));
+    const std::array<std::uint8_t, 8> red{0, 0xf8, 0, 0, 0, 0, 0, 0};
+    for (std::size_t offset = 0; offset < ComputeSurfaceSize(tiledMips, 1); offset += red.size()) std::memcpy(tiled.Texels() + offset, red.data(), red.size());
+    FillInput();
+    Dispatch(device, tiled.Texels(), 0u, TileS64KB);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        for (std::uint32_t index = 0; index < 4u; ++index) {
+            const auto result = tid * Words + ResultWord + index * 4u;
+            Require(std::bit_cast<float>(Buffer[result]) == 1.0f && std::bit_cast<float>(Buffer[result + 3u]) == 1.0f, "compacted tiled BC1 upload sampled incorrect data");
+        }
+    }
     GuestBlock whole(Mips(), BlockBytes(Mips()));
     FillLevels(whole.Texels(), 0);
     Sampled(device, whole.Texels(), n, 0u, "every level mapped");
