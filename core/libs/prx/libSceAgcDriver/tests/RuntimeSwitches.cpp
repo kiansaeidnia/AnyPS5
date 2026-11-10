@@ -42,6 +42,7 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_NO_PARALLEL_BLOCK_HASH") == RuntimeSwitch::NoParallelBlockHash, "parallel block hash is not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_NO_DEFER_LANE_EDGE") == RuntimeSwitch::NoDeferLaneEdge, "the lane edge of GPU-ordered write-backs is not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_STABLE_SAMPLED_SET") == RuntimeSwitch::StableSampledSet, "the stable sampled set is not runtime switchable");
+    Require(RuntimeSwitches::Find("APS5_SAMPLED_CACHE_CEILING") == RuntimeSwitch::SampledCacheCeiling, "sampled cache ceiling retention is not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_HOST_SIZE_CLASSES") == RuntimeSwitch::HostSizeClasses, "host buffer size classes are not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_PREPARED_SNAPSHOTS") == RuntimeSwitch::PreparedSnapshots, "prepared snapshots are not runtime switchable");
     Require(RuntimeSwitches::Find("APS5_RELOCATED_DATA_HITS") == RuntimeSwitch::RelocatedDataHits, "relocated draw data hits are not runtime switchable");

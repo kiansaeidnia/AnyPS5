@@ -7293,6 +7293,10 @@ void sampledTextureBudgetTests() {
     reported.heapUsage[2] = 9 * GiB;
     const TextureMemoryUse use{3 * GiB, 2 * GiB, 2 * GiB};
     const auto shared = TextureCacheBudgetsFor(memory, &reported, use);
+    const auto retained = TextureCacheBudgetsFor(memory, &reported, use, 0, true);
+    Require(retained.sampled == shared.ceiling && retained.ceiling == shared.ceiling && retained.storage == shared.storage && retained.target == shared.target && retained.share == shared.share && retained.overflow == shared.overflow, "ceiling retention changed a reservation or failed to retain to the existing ceiling");
+    const auto unreported = TextureCacheBudgetsFor(memory, nullptr, use, 0, true);
+    Require(unreported.sampled == 4 * GiB && unreported.ceiling == 5 * GiB, "ceiling retention expanded a cache without a reported heap budget");
     expect(shared, 5184 * MiB, 4 * GiB, 10304 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches");
     Require(shared.ceiling + shared.storage + (use.sampled - use.sampledCached) + 4 * GiB + 960 * MiB == 15 * GiB, "the texture caches, the sampled images outside them, the other users and the headroom do not add up to the device's budget");
     // The reported usage moving by less than a sixty-fourth of the share (161 MiB here) keeps the
@@ -7325,6 +7329,8 @@ void sampledTextureBudgetTests() {
     reported.heapUsage[2] = 9 * GiB;
     expect(TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 6 * GiB}), 6208 * MiB, 4 * GiB, 12352 * MiB, "a storage cache above its budget is not counted at its size against the sampled cache");
     reported.heapUsage[2] = 15 * GiB;
+    const auto pressured = TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 0}, 0, true);
+    Require(pressured.sampled == pressured.ceiling && pressured.sampled == 256 * MiB && pressured.storage == 256 * MiB, "ceiling retention ignored the pressure floor or consumed storage's reservation");
     expect(TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 0}), 256 * MiB, 256 * MiB, 512 * MiB, "a heap whose other users leave no room does not keep the 512 MiB floor, half of it for each cache");
     memory.memoryHeaps[0].flags = 0;
     memory.memoryHeaps[2].flags = 0;

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1076,7 +1077,7 @@ std::uint64_t ExpectedBudget(const Context& context) {
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
     ReportBudget(context.physical, &properties);
     const auto use = TextureCacheUsage();
-    return TextureCacheBudgetsFor(context.memory, &reported, {SampledTextureMemory(), use.sampledBytes, use.storageBytes}, CurrentTextureCacheBudgets(context).target).sampled;
+    return TextureCacheBudgetsFor(context.memory, &reported, {SampledTextureMemory(), use.sampledBytes, use.storageBytes}, CurrentTextureCacheBudgets(context).target, RuntimeSwitches::Set(RuntimeSwitch::SampledCacheCeiling)).sampled;
 }
 
 std::uint64_t ReadBudget(const Context& context) {
@@ -1101,6 +1102,15 @@ std::uint64_t ReadStorageBudget(const Context& context) {
 
 void memoryTests(Context context) {
     context.memoryProperties2 = &ReportBudget;
+    const bool original = RuntimeSwitches::Set(RuntimeSwitch::SampledCacheCeiling);
+    RuntimeSwitches::Assign(RuntimeSwitch::SampledCacheCeiling, false);
+    const auto normal = CurrentTextureCacheBudgets(context);
+    RuntimeSwitches::Assign(RuntimeSwitch::SampledCacheCeiling, true);
+    const auto expanded = CurrentTextureCacheBudgets(context);
+    Require(expanded.sampled == normal.ceiling && expanded.ceiling == normal.ceiling && expanded.storage == normal.storage && expanded.target == normal.target, "changing ceiling retention did not immediately refresh the budget while preserving its reservations");
+    RuntimeSwitches::Assign(RuntimeSwitch::SampledCacheCeiling, false);
+    Require(CurrentTextureCacheBudgets(context).sampled == normal.sampled, "disabling ceiling retention did not immediately restore its previous budget");
+    RuntimeSwitches::Assign(RuntimeSwitch::SampledCacheCeiling, original);
     const auto before = SampledTextureMemory();
     Block block(context);
     auto held = Sampled(context, block.Surface(0));

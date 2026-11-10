@@ -115,6 +115,7 @@ enum class RuntimeSwitch : std::size_t {
     HostSizeClasses,
     PreparedSnapshots,
     RelocatedDataHits,
+    SampledCacheCeiling,
     Count,
 };
 

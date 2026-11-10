@@ -1385,6 +1385,7 @@ struct BudgetState {
     VkPhysicalDevice device = VK_NULL_HANDLE;
     std::chrono::steady_clock::time_point readAt{};
     TextureCacheBudgets budgets;
+    bool retainToCeiling = false;
     std::uint64_t reportedBudget = 0;
     std::chrono::steady_clock::time_point reportedAt{};
 };
@@ -1416,14 +1417,15 @@ TextureCacheBudgets readBudgets(const Context& context, bool reread) {
     auto& state = Budgets();
     std::lock_guard lock(state.mutex);
     const auto now = std::chrono::steady_clock::now();
-    if (!reread && state.device == context.physical && now - state.readAt < std::chrono::seconds(1)) return state.budgets;
+    const bool retainToCeiling = RuntimeSwitches::Set(RuntimeSwitch::SampledCacheCeiling);
+    if (!reread && state.device == context.physical && state.retainToCeiling == retainToCeiling && now - state.readAt < std::chrono::seconds(1)) return state.budgets;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
     const TextureMemoryUse use{SampledTextureMemory(), SampledCachedBytes().load(std::memory_order_relaxed), storageCacheBytes(), SampledTextureOverflowMemory()};
     const bool fresh = state.device != context.physical;
-    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, use, fresh ? 0u : state.budgets.target);
+    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, use, fresh ? 0u : state.budgets.target, retainToCeiling);
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(state.reportedBudget, budgets.sampled, now - state.reportedAt))) {
         char was[48] = "";
         if (!fresh) std::snprintf(was, sizeof(was), " (was %llu MiB)", static_cast<unsigned long long>(state.reportedBudget >> 20u));
@@ -1435,6 +1437,7 @@ TextureCacheBudgets readBudgets(const Context& context, bool reread) {
     state.device = context.physical;
     state.readAt = now;
     state.budgets = budgets;
+    state.retainToCeiling = retainToCeiling;
     return budgets;
 }
 
@@ -2463,7 +2466,7 @@ std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     return std::min<std::uint64_t>(StorageTextureCeiling(memory, reported), std::max<std::uint64_t>(512ull << 20u, budget > reserved ? budget - reserved : 0u));
 }
 
-TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use, std::uint64_t previousTarget) {
+TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use, std::uint64_t previousTarget, bool retainToCeiling) {
     constexpr std::uint64_t MiB = 1ull << 20u;
     const auto fixed = TextureCacheBudget(memory);
     const auto heap = largestDeviceLocalHeap(memory);
@@ -2490,7 +2493,7 @@ TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryPropertie
         const auto reserve = reported->heapUsage[*system] + systemBudget / 16u;
         overflow = std::max<std::uint64_t>(systemBudget > reserve ? systemBudget - reserve : 0u, 1u);
     }
-    return {ceiling - ceiling / 5u, ceiling, storage, target, ceiling + outside, overflow};
+    return {retainToCeiling ? ceiling : ceiling - ceiling / 5u, ceiling, storage, target, ceiling + outside, overflow};
 }
 
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {
