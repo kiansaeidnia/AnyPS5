@@ -29,6 +29,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class Texture;
 
 struct PassLibraryState {
     VkCullModeFlags cullMode;
@@ -321,7 +322,9 @@ public:
     static void CountTemplateEdge(bool beforeRefresh);
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
-    void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    enum class KeptKind : std::uint8_t { Other, Upload };
+    void Keep(std::shared_ptr<void> object, std::size_t bytes = 0, KeptKind kind = KeptKind::Other);
+    void ProfileSampledKeep(const std::shared_ptr<Texture>& texture);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
@@ -907,6 +910,8 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
+        std::size_t uploadBytes = 0;
+        std::unordered_map<const Texture*, std::weak_ptr<Texture>> sampledKept;
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;

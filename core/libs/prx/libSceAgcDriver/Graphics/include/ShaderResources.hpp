@@ -26,6 +26,7 @@
 namespace AgcDriver { class VulkanDevice; }
 
 namespace AgcDriver::Graphics {
+void ProfileSampledWrite(std::uint64_t address, std::size_t bytes);
 
 class Recorder;
 

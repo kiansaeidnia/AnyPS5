@@ -58,6 +58,75 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+bool sampledSetProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_SAMPLED_SET") != nullptr;
+    return enabled;
+}
+
+struct SampledSetProfile {
+    struct Surface {
+        std::uint64_t bytes = 0;
+        std::uint32_t mips = 0;
+        bool compressed = false;
+    };
+    std::uint64_t present = 0;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, Surface> surfaces;
+    std::map<std::uint64_t, std::uint64_t> writes;
+    std::vector<std::string> reports;
+    std::uint64_t omitted = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+SampledSetProfile& sampledSetProfile() {
+    static SampledSetProfile profile;
+    const auto present = Recorder::Presents();
+    if (profile.present == present) return profile;
+    std::array<std::uint64_t, 5> sizes{}, sizeBytes{};
+    std::array<std::uint64_t, 4> mips{};
+    std::uint64_t bytes = 0, bc = 0, bcBytes = 0, gpu = 0, gpuBytes = 0;
+    for (const auto& [range, surface] : profile.surfaces) {
+        const auto size = surface.bytes;
+        const auto bucket = size < (64u << 10u) ? 0u : size < (1u << 20u) ? 1u : size < (4u << 20u) ? 2u : size < (16u << 20u) ? 3u : 4u;
+        ++sizes[bucket];
+        sizeBytes[bucket] += size;
+        ++mips[surface.mips <= 1 ? 0 : surface.mips <= 4 ? 1 : surface.mips <= 8 ? 2 : 3];
+        bytes += size;
+        if (surface.compressed) { ++bc; bcBytes += size; }
+        auto write = profile.writes.upper_bound(range.first);
+        if (write != profile.writes.begin() && std::prev(write)->second > range.first) --write;
+        if (write != profile.writes.end() && write->first < range.first + range.second && write->second > range.first) { ++gpu; gpuBytes += size; }
+    }
+    char text[1024];
+    std::snprintf(text, sizeof(text), "[sampled-set] present %llu: %zu surfaces %.2f MiB guest; BCn %llu %.2f MiB, uncompressed %llu %.2f MiB; GPU-written %llu %.2f MiB, no GPU write %llu %.2f MiB; sizes <64KiB/<1MiB/<4MiB/<16MiB/16MiB+ count %llu/%llu/%llu/%llu/%llu MiB %.2f/%.2f/%.2f/%.2f/%.2f; mips 1/2-4/5-8/9+ %llu/%llu/%llu/%llu\n",
+        static_cast<unsigned long long>(profile.present), profile.surfaces.size(), bytes / 1048576.0,
+        static_cast<unsigned long long>(bc), bcBytes / 1048576.0, static_cast<unsigned long long>(profile.surfaces.size() - bc), (bytes - bcBytes) / 1048576.0,
+        static_cast<unsigned long long>(gpu), gpuBytes / 1048576.0, static_cast<unsigned long long>(profile.surfaces.size() - gpu), (bytes - gpuBytes) / 1048576.0,
+        static_cast<unsigned long long>(sizes[0]), static_cast<unsigned long long>(sizes[1]), static_cast<unsigned long long>(sizes[2]), static_cast<unsigned long long>(sizes[3]), static_cast<unsigned long long>(sizes[4]),
+        sizeBytes[0] / 1048576.0, sizeBytes[1] / 1048576.0, sizeBytes[2] / 1048576.0, sizeBytes[3] / 1048576.0, sizeBytes[4] / 1048576.0,
+        static_cast<unsigned long long>(mips[0]), static_cast<unsigned long long>(mips[1]), static_cast<unsigned long long>(mips[2]), static_cast<unsigned long long>(mips[3]));
+    if (profile.reports.size() < 256) profile.reports.emplace_back(text);
+    else ++profile.omitted;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - profile.reported >= std::chrono::seconds(10)) {
+        for (const auto& report : profile.reports) AgcDriver::ProfilePrint_nid_no_patch("%s", report.c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("[sampled-set] report: %zu completed presents, %llu omitted at cap\n", profile.reports.size(), static_cast<unsigned long long>(profile.omitted));
+        profile.reports.clear();
+        profile.omitted = 0;
+        profile.reported = now;
+    }
+    profile.present = present;
+    profile.surfaces.clear();
+    profile.writes.clear();
+    return profile;
+}
+
+void profileSampledUse(const GuestTextureResource& resource, std::uint64_t bytes) {
+    if (!sampledSetProfiled() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    auto& profile = sampledSetProfile();
+    if (bytes == 0) bytes = DescribeSurface(resource).guestBytes;
+    profile.surfaces.try_emplace(std::pair{resource.baseAddress, bytes}, SampledSetProfile::Surface{bytes, resource.mipCount, IsBlockCompressed(resource.format)});
+}
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -1137,6 +1206,7 @@ std::vector<LookupRecord>& lookupLog() {
 }
 
 void logLookup(const LookupRecord& record) {
+    profileSampledUse(record.resource, record.bytes);
     auto& log = lookupLog();
     if (log.size() >= LookupLogBound) {
         const auto dropped = std::min(LookupLogBound / 2, buildLookupsStart);
@@ -2872,7 +2942,28 @@ bool SameAsPreviousStorageElement(const ShaderRecompiler::DescriptorBinding& bin
 
 ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes) : ShaderResources(context, std::array<CompiledShader, 2>{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, static_cast<std::uint32_t>(vertex.pushConstants.size())}}}, target, 1, indexAddress, indexBytes) {}
 
+void ProfileSampledWrite(std::uint64_t address, std::size_t bytes) {
+    if (!sampledSetProfiled() || bytes == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    auto& writes = sampledSetProfile().writes;
+    auto end = address + bytes;
+    if (end < address) return;
+    auto it = writes.lower_bound(address);
+    if (it != writes.begin() && std::prev(it)->second >= address) --it;
+    while (it != writes.end() && it->first <= end) {
+        address = std::min(address, it->first);
+        end = std::max(end, it->second);
+        it = writes.erase(it);
+    }
+    writes.emplace(address, end);
+}
+
 void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
+    if (sampledSetProfiled()) {
+        for (const auto& surface : validatedTextures) {
+            if (surface.valid) profileSampledUse(surface.resource, surface.bytes);
+        }
+    }
+    for (const auto& texture : textures) recorder.ProfileSampledKeep(texture);
     const auto keep = [&](const std::shared_ptr<StorageTexture>& image) {
         if (image != nullptr && !image->Cached()) recorder.KeepBytes(image.get(), static_cast<std::size_t>(image->BudgetBytes()));
     };

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/StagingDiffCopyBack_spv.h"
@@ -3861,7 +3862,7 @@ std::size_t Recorder::UnsignaledBatches() const {
     return static_cast<std::size_t>(std::count_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return !signaled(*batch); }));
 }
 
-void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
+void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes, KeptKind kind) {
     ensureOpen();
     if (asyncTimeline != VK_NULL_HANDLE) {
         // Held until the other lane's work recorded so far finished as well: an object retired by
@@ -3872,6 +3873,7 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     }
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
+    if (kind == KeptKind::Upload) open->uploadBytes += bytes;
 }
 
 void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
@@ -3907,6 +3909,7 @@ bool Recorder::RetireOldest() {
 namespace {
 struct KeptWaits {
     std::atomic<std::uint64_t> waits{0}, ns{0}, keptMiB{0}, batches{0}, submits{0}, destroys{0};
+    std::atomic<std::uint64_t> uploadBytes{0}, otherBytes{0}, cachedBytes{0}, oneOffBytes{0};
 };
 KeptWaits& KeptWaitCounts() {
     static KeptWaits waits;
@@ -3916,6 +3919,11 @@ bool KeptWaitsProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_WAITS") != nullptr;
     return profiled;
 }
+}
+
+void Recorder::ProfileSampledKeep(const std::shared_ptr<Texture>& texture) {
+    if (!KeptWaitsProfiled() || texture == nullptr || open == nullptr) return;
+    open->sampledKept[texture.get()] = texture;
 }
 
 void Recorder::BoundKeptBytes() {
@@ -3932,6 +3940,21 @@ void Recorder::BoundKeptBytes() {
     const bool waits = profiled && !inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget;
     const auto start = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto keptBefore = inFlightKeptBytes;
+    if (waits) {
+        auto& counts = KeptWaitCounts();
+        std::unordered_set<const Texture*> seen;
+        for (const auto& batch : inFlight) {
+            counts.uploadBytes.fetch_add(batch->uploadBytes, std::memory_order_relaxed);
+            counts.otherBytes.fetch_add(batch->keptBytes - batch->uploadBytes, std::memory_order_relaxed);
+            for (const auto& [pointer, weak] : batch->sampledKept) {
+                if (!seen.insert(pointer).second) continue;
+                const auto texture = weak.lock();
+                if (texture == nullptr) continue;
+                auto& bytes = texture->SampledCacheState() == Texture::CacheState::Cached ? counts.cachedBytes : counts.oneOffBytes;
+                bytes.fetch_add(texture->AllocationBytes(), std::memory_order_relaxed);
+            }
+        }
+    }
     std::uint64_t finished = 0;
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
@@ -3958,7 +3981,14 @@ std::string Recorder::KeptWaitReport() {
     const auto destroys = counts.destroys.exchange(0, std::memory_order_relaxed);
     char text[320];
     std::snprintf(text, sizeof(text), "[kept-wait] BoundKeptBytes waits (10 s): %llu in %.1f ms for %llu batches (in-flight kept at the wait %.0f MiB avg, bound %zu MiB); open-batch submits at the budget %llu, deferred destroys %llu", static_cast<unsigned long long>(waits), ns / 1e6, static_cast<unsigned long long>(batches), waits != 0 ? static_cast<double>(kept) / static_cast<double>(waits) : 0.0, (2 * KeptBytesBudget) >> 20u, static_cast<unsigned long long>(submits), static_cast<unsigned long long>(destroys));
-    return text;
+    std::string result = text;
+    const auto upload = counts.uploadBytes.exchange(0, std::memory_order_relaxed);
+    const auto other = counts.otherBytes.exchange(0, std::memory_order_relaxed);
+    const auto cached = counts.cachedBytes.exchange(0, std::memory_order_relaxed);
+    const auto oneOff = counts.oneOffBytes.exchange(0, std::memory_order_relaxed);
+    const auto divisor = 1048576.0 * static_cast<double>(std::max<std::uint64_t>(waits, 1));
+    std::snprintf(text, sizeof(text), "\n[kept-composition] mean per wait: charged uploads %.2f MiB, other %.2f MiB; observed sampled images (not charged): cached %.2f MiB, one-off/released %.2f MiB", upload / divisor, other / divisor, cached / divisor, oneOff / divisor);
+    return result + text;
 }
 
 namespace {
@@ -4374,6 +4404,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 }
 
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
+    ProfileSampledWrite(address, bytes);
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
@@ -4398,6 +4429,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
 }
 
 void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel) {
+    ProfileSampledWrite(address, bytes);
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
