@@ -485,8 +485,24 @@ static void RecordLocksBelongToTheProcess() {
     Require(fcntl_nid_postfix(directory, SetLock, &read) == 0);
     RequireFailure(fcntl_nid_postfix(directory, SetLock, &write), GuestEbadf);
     Require(NoConflict(directory, {0, 0, 0, WriteLock, FromCurrent, 0}));
+    FileStat directoryStatus{};
+    Require(fstat_nid_disambig1_nid_postfix(directory, &directoryStatus) == 0 && directoryStatus.st_size >= 0);
     GuestLock directoryEnd{0, 0, 0, ReadLock, FromEnd, 0};
-    Require(ThrowsWith([directory, &directoryEnd] { fcntl_nid_postfix(directory, SetLock, &directoryEnd); }, "fcntl: a record lock from the end on a directory is not implemented"));
+    Require(fcntl_nid_postfix(directory, SetLock, &directoryEnd) == 0);
+    Require(fcntl_nid_postfix(directory, SetLockWait, &directoryEnd) == 0);
+    Require(NoConflict(directory, {0, 0, 0, WriteLock, FromEnd, 3}));
+    Require(NoConflict(directory, {-directoryStatus.st_size, 1, 0, ReadLock, FromEnd, 0}));
+    GuestLock directoryRelease{-directoryStatus.st_size, 0, 0, Unlock, FromEnd, 0};
+    Require(fcntl_nid_postfix(directory, SetLock, &directoryRelease) == 0);
+    GuestLock beforeDirectory{-directoryStatus.st_size - 1, 0, 0, ReadLock, FromEnd, 0};
+    RequireFailure(fcntl_nid_postfix(directory, SetLock, &beforeDirectory), GuestEinval);
+    RequireFailure(fcntl_nid_postfix(directory, GetLock, &beforeDirectory), GuestEinval);
+    GuestLock backwardsFromDirectoryStart{-directoryStatus.st_size, -1, 0, ReadLock, FromEnd, 0};
+    RequireFailure(fcntl_nid_postfix(directory, SetLock, &backwardsFromDirectoryStart), GuestEinval);
+    GuestLock pastDirectory{std::numeric_limits<std::int64_t>::max(), 2, 0, ReadLock, FromEnd, 0};
+    RequireFailure(fcntl_nid_postfix(directory, SetLock, &pastDirectory), GuestEoverflow);
+    RequireFailure(fcntl_nid_postfix(directory, GetLock, &pastDirectory), GuestEoverflow);
+    Require(sceKernelFcntl(directory, SetLock, &beforeDirectory) == SceEinval);
     Require(close_nid_postfix(directory) == 0);
     std::filesystem::remove("kernel_fcntl_locks_dir");
 #endif

@@ -4,6 +4,7 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
@@ -263,7 +264,12 @@ std::int64_t LockOffset(int fd, Kind kind) {
 }
 
 std::int64_t LockFileSize(int fd, Kind kind) {
-    if (kind == Kind::Directory) Unsupported("fcntl", "a record lock from the end", kind, fd);
+    if (kind == Kind::Directory) {
+        FileStat status{};
+        if (!File::FillFileStatFromDescriptor(fd, &status))
+            throw std::runtime_error("fcntl: cannot read the size of directory descriptor " + std::to_string(fd) + ", errno=" + std::to_string(errno));
+        return status.st_size;
+    }
     const auto size = ::_filelengthi64(fd);
     if (size < 0) throw std::runtime_error("fcntl: cannot read the size of descriptor " + std::to_string(fd) + ", errno=" + std::to_string(errno));
     return size;
